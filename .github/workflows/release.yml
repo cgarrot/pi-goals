@@ -1,0 +1,38 @@
+name: Release
+
+# Publishes to the npm registry when a version tag (v*) is pushed.
+# pi.dev indexes npm packages tagged pi-package (keywords already set),
+# so publishing here makes the package appear in the pi.dev gallery.
+#
+# Requires a repository secret named NPM_TOKEN (an npm automation access
+# token). Without it the publish step fails with an auth error — add the
+# secret at Settings → Secrets and variables → Actions → New repository
+# secret.
+#
+# Release flow:
+#   npm version patch|minor|major
+#   push the resulting v* tag through your governed commit flow
+# (npm test runs the full build + test suite before the publish step.)
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run ci
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

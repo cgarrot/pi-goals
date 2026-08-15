@@ -1,0 +1,63 @@
+{
+  "name": "pi-goals-extension",
+  "version": "0.1.0",
+  "description": "Standalone Pi extension for parent-owned goal/TODO work graphs with delegated claims, CAS receipts, and oracle-gated completion. Zero runtime dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cgarrot/pi-goals.git"
+  },
+  "homepage": "https://github.com/cgarrot/pi-goals#readme",
+  "bugs": {
+    "url": "https://github.com/cgarrot/pi-goals/issues"
+  },
+  "author": "Cl\u00e9ment Garrot <clement.garrot.dev@gmail.com> (https://github.com/cgarrot)",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "goals",
+    "todo"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "files": [
+    "src",
+    "dist",
+    "!dist/test",
+    "index.ts",
+    "README.md",
+    "LICENSE",
+    "skills",
+    "scripts",
+    "docs"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node scripts/run-tests.mjs",
+    "smoke": "node scripts/goals-smoke.mjs",
+    "cli": "node dist/src/cli/goals.js",
+    "ci": "npm run build && node scripts/run-tests.mjs && npm run smoke",
+    "prepublishOnly": "npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0"
+  },
+  "bin": {
+    "goals": "./dist/src/cli/goals.js"
+  }
+}
