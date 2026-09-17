@@ -1164,18 +1164,16 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
     label: "Get Goal Todos",
     description: "Show the goal's TODO tree (status icons ○ ● ✓ ⊘ ⤫ + progress). A bare call renders the full tree; an optional canonical ref narrows to one node.",
     parameters: {
+      // Plain object root — some OpenAI-compatible providers (e.g. xAI grok)
+      // reject tool parameter roots that resolve to anyOf/oneOf unions with
+      // non-object branches (400 "tool parameter root must be an object type").
+      // todo_id/todo_path stay OPTIONAL: a bare call returns the full tree,
+      // and either ref narrows the view (enforced by the executor).
       type: "object",
       properties: {
         goal_id: { type: "string", description: "Optional goal id. Defaults to the active goal." },
         ...REF_SCHEMA_OPTIONAL,
       },
-      // batch-#2 fix: todo_id/todo_path are optional (anyOf style) — a bare
-      // call means the full tree; when present, either ref narrows the view.
-      anyOf: [
-        { properties: { todo_id: false, todo_path: false } },
-        { required: ["todo_id"] },
-        { required: ["todo_path"] },
-      ],
     },
     execute: fire(execGetGoalTodos),
   });

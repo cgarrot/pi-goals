@@ -760,13 +760,18 @@ test("FIX-C tools: get_goal with an unknown goal_id answers 'goal <id> not found
   assert.equal(textOf(missingAfter), "goal goal_0123456789ab not found");
 });
 
-test("FIX-C tools: get_goal_todos schema keeps todo_id/todo_path optional (anyOf; bare call = full tree)", async () => {
+test("FIX-C tools: get_goal_todos schema keeps todo_id/todo_path optional (plain object root; bare call = full tree)", async () => {
   const h = makeToolHarness();
   startSession(h);
   const tool = h.tools.get("get_goal_todos")!;
-  const parameters = tool.parameters as { required?: string[]; anyOf?: unknown[]; properties: Record<string, { description?: string }> };
+  const parameters = tool.parameters as { type?: string; required?: string[]; anyOf?: unknown[]; oneOf?: unknown[]; properties: Record<string, { description?: string }> };
   assert.equal(parameters.required, undefined, "get_goal_todos must not require any parameter");
-  assert.ok(Array.isArray(parameters.anyOf), "get_goal_todos expresses its optional ref shape as anyOf");
+  // Provider compatibility (xAI/OpenAI-compatible): the parameter root must
+  // stay a plain object schema — never an anyOf/oneOf union with non-object
+  // branches (400 "tool parameter root must be an object type").
+  assert.equal(parameters.type, "object", "get_goal_todos parameter root must be a plain object schema");
+  assert.equal(parameters.anyOf, undefined, "get_goal_todos must not use a root anyOf union");
+  assert.equal(parameters.oneOf, undefined, "get_goal_todos must not use a root oneOf union");
   assert.match(parameters.properties.todo_id!.description ?? "", /full tree/i);
   assert.match(parameters.properties.todo_path!.description ?? "", /full tree/i);
   // actual behavior: bare call renders the full tree
