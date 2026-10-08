@@ -965,11 +965,14 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     if (createOptions?.scope !== undefined && !isCanonicalGoalScope(createOptions.scope)) {
       return engineErr("invalid_input", `scope must be canonical (local | agent:<id> | room:<id>), got: ${createOptions.scope}`, "fix_input");
     }
+    // M1 (review follow-up): scope_label is DISPLAY-ONLY and deliberately
+    // EXCLUDED from the CAS request hash — an alias rename between a crash
+    // and its retry must replay, not cas_conflict. The canonical scope
+    // itself stays hash-bound.
     const payload = compactRecord({
       objective: trimmed,
       max_turns: createOptions?.maxTurns,
       scope: createOptions?.scope,
-      scope_label: createOptions?.scopeLabel,
     });
     return run("create_goal", payload, cas, (ctx) => {
       const scope = createOptions?.scope ?? LOCAL_GOAL_SCOPE;

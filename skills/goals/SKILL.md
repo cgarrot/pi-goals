@@ -32,7 +32,9 @@ Rules you MUST follow:
   `create_goal` (`agent` for your private work, `room:<id>` for shared
   work) — the default stays `local` and only prints a hint;
 - children returning claims don't need the parent's scope:
-  `return_goal_todo_claim` resolves the owning goal by attempt id.
+  `return_goal_todo_claim` resolves the owning goal by attempt id — claim
+  flows are ATTEMPT-FIRST: the binding wins over any provided scope when
+  exactly one goal holds the attempt (scope/goal_id are fallback hints).
 
 ## When to use
 

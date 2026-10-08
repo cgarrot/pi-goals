@@ -256,3 +256,18 @@ test("propose/complete flows are gated per scope (the bench-vs-music production 
   assert.equal(engine.getGoal(musicGoalId).goal?.goal.status, "complete");
   assert.equal(engine.getGoal().goal?.goal.status, "active", "bench campaign still active");
 });
+
+// ---------------------------------------------------------------------------
+// v0.2.1 follow-ups (review M1/M3)
+// ---------------------------------------------------------------------------
+
+test("M1: create replay survives an alias rename (scopeLabel stays out of the CAS hash)", () => {
+  const { engine } = makeHarness();
+  const guard = cas("n1", { goal: 0 });
+  assert.equal(engine.createGoal("replayable lane", guard, { scope: "agent:sess-1", scopeLabel: "old-alias" }).ok, true);
+  // same mutation id, SAME scope, DIFFERENT label (alias renamed since) → replay, not conflict
+  const replay = engine.createGoal("replayable lane", guard, { scope: "agent:sess-1", scopeLabel: "new-alias" });
+  assert.equal(replay.ok && replay.status, "replayed", "a display-only label rename must not break idempotent replay");
+  // a different SCOPE under the same mutation id is still a conflict
+  assert.equal(failure(engine.createGoal("other", cas("n1", { goal: 0 }), { scope: "agent:sess-2" })).code, "cas_conflict");
+});

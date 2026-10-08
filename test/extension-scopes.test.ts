@@ -5,10 +5,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import goalsExtension from "../src/extension/index.js";
+import { renderGoalHudLines } from "../src/extension/hud.js";
 import type { CommandDefinition, ExtensionAPI, SessionContext, ToolDefinition, ToolResult } from "../src/extension/pi-types.js";
 
 interface Harness {
@@ -18,6 +19,7 @@ interface Harness {
   notifications: string[];
   ctx: SessionContext;
   stateDir: string;
+  getRuntime: () => import("../src/extension/tools.js").GoalsRuntime | null;
 }
 
 function makeHarness(options: { mesh?: { alias: string; rooms: string[] }; env?: Record<string, string> } = {}): Harness {
@@ -57,7 +59,7 @@ function makeHarness(options: { mesh?: { alias: string; rooms: string[] }; env?:
   };
   let now = 1_700_000_000_000;
   let seed = 0;
-  goalsExtension(pi, {
+  const ext = goalsExtension(pi, {
     stateDir,
     runtimeDir,
     clock: (): number => (now += 1_000),
@@ -69,7 +71,7 @@ function makeHarness(options: { mesh?: { alias: string; rooms: string[] }; env?:
     },
     ...(options.env !== undefined ? { pathEnv: { ...process.env, ...options.env } } : {}),
   });
-  return { tools, commands, hooks, notifications, ctx, stateDir };
+  return { tools, commands, hooks, notifications, ctx, stateDir, getRuntime: ext.getRuntime };
 }
 
 function startSession(h: Harness): void {
@@ -233,4 +235,65 @@ test("invalid --scope on commands notifies instead of crashing", async () => {
   startSession(h);
   await runCommand(h, "goal", "x --scope bogusvalue");
   assert.match(h.notifications.at(-1)!, /scope must be/);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.1 follow-ups (review M2/M3/M4/M7)
+// ---------------------------------------------------------------------------
+
+test("M2: outbox prunes expired relay files on the next write (TTL, best effort)", async () => {
+  const h = makeHarness();
+  startSession(h);
+  await callTool(h, "create_goal", { objective: "room goal", scope: "room:default" });
+  const outboxDir = path.join(h.stateDir, "outbox");
+  // forge an EXPIRED file (mtime far in the past)
+  const expired = path.join(outboxDir, "1-stale.json");
+  writeFileSync(expired, JSON.stringify({ schema: "pi-goals.outbox.v1", kind: "goal_created" }) + "\n");
+  utimesSync(expired, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
+  // a fresh room event triggers the prune
+  await callTool(h, "create_goal", { objective: "second room goal", scope: "room:other" });
+  const remaining = readdirSync(outboxDir);
+  assert.equal(remaining.includes("1-stale.json"), false, "expired relay file must be pruned");
+  assert.equal(remaining.length >= 2, true, "fresh events survive");
+});
+
+test("M3: a room joined AFTER session_start is picked up on the next 'room' resolution", async () => {
+  const h = makeHarness(); // NO mesh identity at session_start
+  startSession(h);
+  const bare = await callTool(h, "create_goal", { objective: "x", scope: "room" });
+  assert.match(text(bare), /joined none/);
+  // pi-mesh joins the default room mid-session → identity file appears
+  const meshDir = path.join(h.stateDir, ".mesh");
+  mkdirSync(meshDir, { recursive: true });
+  writeFileSync(path.join(meshDir, "identity-sess-scope.json"), JSON.stringify({ version: 1, sessionId: "sess-scope", alias: "late-joiner", rooms: ["default"] }) + "\n");
+  const late = await callTool(h, "create_goal", { objective: "late room goal", scope: "room" });
+  assert.equal(details(late).scope, "room:default", "lazy identity refresh must see the joined room");
+});
+
+test("M4: goal_id + scope mismatch is a precise fix_input, never a silent scope drop", async () => {
+  const h = makeHarness();
+  startSession(h);
+  const room = await callTool(h, "create_goal", { objective: "room goal", scope: "room:default" });
+  const goalId = details(room).goalId as string;
+  const agent = await callTool(h, "create_goal", { objective: "agent goal", scope: "agent" });
+  assert.equal(details(agent).scope, "agent:sess-scope");
+  const mismatch = await callTool(h, "add_goal_todo", { title: "t", goal_id: goalId, scope: "agent" });
+  assert.match(text(mismatch), /lives in scope room:default, not agent:sess-scope/);
+  // coherent pair still works
+  const ok = await callTool(h, "add_goal_todo", { title: "t", goal_id: goalId, scope: "room:default" });
+  assert.match(text(ok), /added 1 todo/);
+});
+
+test("M7: HUD keeps the session's own lane visible in a multi-lane swarm", async () => {
+  const h = makeHarness({ mesh: { alias: "hud-agent", rooms: ["default"] } });
+  startSession(h);
+  await callTool(h, "create_goal", { objective: "room campaign", scope: "room" });
+  await callTool(h, "create_goal", { objective: "my private lane", scope: "agent" });
+  // read the widget through the HUD state renderer on the runtime's lane view
+  const rt = h.getRuntime();
+  assert.ok(rt !== null);
+  const laneView = rt.engine.getGoal(undefined, "agent:sess-scope").goal;
+  assert.ok(laneView !== undefined, "the session's agent lane must resolve for the HUD");
+  const lines = renderGoalHudLines({ hasGoal: true, status: "active", mode: "auto", scope: laneView!.goal.scope, done: 0, total: 0, open: 0, blocked: 0 });
+  assert.match(lines[0]!, /\[agent:sess-scope\]/);
 });

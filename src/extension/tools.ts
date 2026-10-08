@@ -18,7 +18,7 @@ import type { GoalMutationGuardInput, GoalMutationReceipt } from "../core/cas.js
 import type { AddGoalTodoNodeItem } from "../core/tree.js";
 import type { GoalRuntimeEngine, GoalEngineError, GoalRuntimeView, GoalSelector, GoalOverviewEntry } from "../runtime/engine.js";
 import type { MeshIdentity, ScopeShorthandResult } from "../shared/scope.js";
-import { resolveScopeShorthand } from "../shared/scope.js";
+import { readMeshIdentity, resolveScopeShorthand } from "../shared/scope.js";
 import type { ExtensionAPI, ToolResult } from "./pi-types.js";
 import { textResult } from "./pi-types.js";
 import { renderGoalTodoTree } from "./hud.js";
@@ -40,8 +40,11 @@ export interface GoalsRuntime {
   readonly runtimeDir: string;
   /** Pi session id — stable across /reload. */
   readonly sessionId: string;
-  /** Best-effort pi-mesh identity (alias/rooms) read at session_start; absent without mesh. */
-  readonly meshIdentity?: MeshIdentity;
+  /** pi-mesh state dir for lazy identity re-reads (M3); absent without a cwd. */
+  readonly meshDir?: string;
+  /** Best-effort pi-mesh identity (alias/rooms); MUTABLE — refreshed on
+   * room-scope resolution so a post-session room join is picked up (M3). */
+  meshIdentity?: MeshIdentity;
   /** Canonical default scope from $GOALS_SCOPE (opt-in; undefined = engine fallback). */
   readonly scopeDefault?: string;
   readonly startedAt: number;
@@ -261,6 +264,15 @@ function parseRef(params: Record<string, unknown>): { ref?: { todoId?: string; t
 // Scope plumbing (multi-agent stores — see shared/scope.ts)
 // ---------------------------------------------------------------------------
 
+/** Lazy mesh-identity refresh (M3): rooms may be joined AFTER this session
+ * started; re-read the identity file whenever a room scope is resolved so
+ * bare 'room' stays correct without a restart. Best effort, never throws. */
+function refreshMeshIdentity(rt: GoalsRuntime): void {
+  if (rt.meshDir === undefined) return;
+  const refreshed = readMeshIdentity(rt.meshDir, rt.sessionId);
+  if (refreshed !== undefined) rt.meshIdentity = refreshed;
+}
+
 /** Resolve a scope argument against this session (shorthands agent/room).
  * Absent value → the $GOALS_SCOPE session default (already canonical). */
 function resolveScopeValue(rt: GoalsRuntime, value: unknown, parameter: string): { ok: true; scope?: string } | { ok: false; result: ToolResult } {
@@ -268,18 +280,35 @@ function resolveScopeValue(rt: GoalsRuntime, value: unknown, parameter: string):
     return rt.scopeDefault === undefined ? { ok: true } : { ok: true, scope: rt.scopeDefault };
   }
   if (typeof value !== "string") return { ok: false, result: fixInput(parameter, `parameter '${parameter}' must be a string scope (local | agent | room | room:<id> | agent:<id>)`) };
+  if (value.trim() === "room") refreshMeshIdentity(rt);
   const resolved: ScopeShorthandResult = resolveScopeShorthand(value, { sessionId: rt.sessionId, rooms: rt.meshIdentity?.rooms });
   if (!resolved.ok) return { ok: false, result: fixInput(parameter, `parameter '${parameter}': ${resolved.error}`) };
   return { ok: true, scope: resolved.scope };
 }
 
 /** Mutation target selector from params: goal_id wins, else scope, else the
- * session default scope, else the engine's exactly-one-active fallback. */
+ * session default scope, else the engine's exactly-one-active fallback.
+ * M4: when BOTH goal_id and scope are provided, the goal must BELONG to
+ * that scope — a mismatch is a precise fix_input, not a silent scope drop. */
 function parseGoalTarget(rt: GoalsRuntime, params: Record<string, unknown>): { ok: true; selector?: GoalSelector } | { ok: false; result: ToolResult } {
   const goalId = params.goal_id;
   if (goalId !== undefined) {
     if (typeof goalId !== "string" || goalId.trim().length === 0) {
       return { ok: false, result: fixInput("goal_id", "parameter 'goal_id' must be a non-empty goal id") };
+    }
+    if (params.scope !== undefined) {
+      const scope = resolveScopeValue(rt, params.scope, "scope");
+      if (!scope.ok) return scope;
+      if (scope.scope !== undefined) {
+        const read = readView(rt, goalId);
+        if (read.error) return { ok: false, result: read.error };
+        if (read.view !== undefined) {
+          const goalScope = read.view.goal.scope ?? "local";
+          if (goalScope !== scope.scope) {
+            return { ok: false, result: fixInput("goal_id", `parameter 'goal_id': goal ${goalId} lives in scope ${goalScope}, not ${scope.scope} — pass one or the other`) };
+          }
+        }
+      }
     }
     return { ok: true, selector: { goalId } };
   }

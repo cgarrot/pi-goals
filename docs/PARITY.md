@@ -114,10 +114,14 @@ listed as a deviation or does not exist — no invented parity.
 
 ## Known limitations (v0.1.x)
 
-- v0.2 scope note: scope GC/pruning of long-lived `agent:*` zombie lanes is
-  NOT shipped (`get_goals` lists them for manual cleanup; a future `prune`
-  CLI may add TTL-based reclaim). The outbox is a one-way file drop — no
-  pi-mesh relay ships in this package.
+- v0.2 scope notes: (1) scope GC/pruning of long-lived `agent:*` zombie
+  LANES is not shipped (`get_goals` lists them for manual cleanup; a future
+  `prune` CLI may add reclaim); the room OUTBOX itself now self-prunes
+  expired relay files on write (M2, 7-day TTL). (2) No pi-mesh relay ships
+  in this package — the outbox is a one-way file drop. v0.2.1 closed the
+  review follow-ups M1 (scopeLabel out of the create CAS hash), M3 (lazy
+  identity refresh), M4 (goal_id+scope coherence), M5 (attempt-first docs),
+  M6 (CLI --scope), M7 (swarm HUD lane).
 
 - The continuation loop is a port (`LoopHooks`): the package ships no
   auto-continuation runner; hosts/CLIs inject it (by design, R7).

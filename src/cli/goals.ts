@@ -24,19 +24,21 @@ import { restoreAllGoals } from "../store/restore.js";
 import type { RestoredGoalStore } from "../store/restore.js";
 import { casReceiptsPath, readStreamText } from "../store/log.js";
 import { stateDir as resolveStateDir } from "../shared/paths.js";
+import { isCanonicalGoalScope } from "../shared/scope.js";
 
 const USAGE = [
-  "usage: goals [--state-dir <dir>] <command> [goalId]",
+  "usage: goals [--state-dir <dir>] [--scope <local|agent:<id>|room:<id>>] <command> [goalId]",
   "commands:",
-  "  status [goalId] — active (or given) goal status block",
-  "  tree   [goalId] — TODO tree with icons and progress",
-  "  list            — one line per goal in the store",
+  "  status [goalId] — active (or given) goal status block (--scope picks the lane's active goal)",
+  "  tree   [goalId] — TODO tree with icons and progress (--scope picks the lane's active goal)",
+  "  list            — one line per goal in the store (scope column)",
   "  stats           — aggregate counts over the whole store",
   "  export          — deterministic JSON dump (goal + todos + claims + receipts)",
 ].join("\n");
 
 interface CliArgs {
   stateDir?: string;
+  scope?: string;
   command?: string;
   goalId?: string;
   error?: string;
@@ -51,6 +53,13 @@ function parseArgs(argv: readonly string[]): CliArgs {
       const value = argv[index + 1];
       if (value === undefined || value.trim().length === 0) return { error: "--state-dir requires a non-empty directory path" };
       args.stateDir = value;
+      index += 1;
+      continue;
+    }
+    if (arg === "--scope") {
+      const value = argv[index + 1];
+      if (value === undefined || value.trim().length === 0) return { error: "--scope requires a scope value (local | agent:<id> | room:<id>)" };
+      args.scope = value;
       index += 1;
       continue;
     }
@@ -136,16 +145,21 @@ function readStore(stateDir: string): StoreView {
   return { goals };
 }
 
-function requireActiveGoal(store: StoreView, goalId: string | undefined): { goalId: string; restored: RestoredGoalStore } | undefined {
+function requireActiveGoal(store: StoreView, goalId: string | undefined, scope?: string): { goalId: string; restored: RestoredGoalStore } | undefined {
   if (goalId !== undefined) {
     const match = store.goals.find((entry) => entry.goalId === goalId);
     if (match === undefined) fail(`no goal ${goalId} exists in the store`);
     return match;
   }
-  const open = store.goals.filter((entry) => entry.restored.goal?.status !== "complete");
+  const scopeOf = (entry: { restored: RestoredGoalStore }): string => entry.restored.goal?.scope ?? "local";
+  let open = store.goals.filter((entry) => entry.restored.goal?.status !== "complete");
+  if (scope !== undefined) open = open.filter((entry) => scopeOf(entry) === scope);
+  if (scope !== undefined && open.length === 0) {
+    fail(`no non-complete goal exists in scope ${scope} — 'goals list' shows every lane`);
+  }
   if (open.length > 1) {
-    const lanes = open.map((entry) => `${entry.goalId} [${entry.restored.goal?.scope ?? "local"}]`).sort();
-    fail(`multiple non-complete goals exist: ${lanes.join(", ")} — pass an explicit goalId (scopes: ${[...new Set(open.map((entry) => entry.restored.goal?.scope ?? "local"))].sort().join(", ")})`);
+    const lanes = open.map((entry) => `${entry.goalId} [${scopeOf(entry)}]`).sort();
+    fail(`multiple non-complete goals exist${scope !== undefined ? ` in scope ${scope}` : ""}: ${lanes.join(", ")} — pass an explicit goalId (--scope ${[...new Set(open.map((entry) => scopeOf(entry)))].sort().join("|")})`);
   }
   if (open.length === 1) return open[0];
   // no open goal: fall back to the most recently updated complete goal (clear semantics)
@@ -153,6 +167,7 @@ function requireActiveGoal(store: StoreView, goalId: string | undefined): { goal
   for (const entry of store.goals) {
     const goal = entry.restored.goal;
     if (goal === undefined) continue;
+    if (scope !== undefined && (goal.scope ?? "local") !== scope) continue;
     if (
       best === undefined
       || goal.updatedAt > best.restored.goal!.updatedAt
@@ -197,7 +212,10 @@ function main(): void {
   const store = readStore(stateDir);
 
   if (command === "status" || command === "tree") {
-    const target = requireActiveGoal(store, args.goalId);
+    if (args.scope !== undefined && !isCanonicalGoalScope(args.scope)) {
+      failUsage(`invalid --scope '${args.scope}' — canonical scopes are local | agent:<id> | room:<id>\n${USAGE}`);
+    }
+    const target = requireActiveGoal(store, args.goalId, args.scope);
     if (target === undefined) fail(`no goal exists under ${stateDir} — create one with the extension (/goal <objective>) or pass --state-dir`);
     // same restore path as the extension: engine.getGoal replays streams + overlay
     const engine: GoalRuntimeEngine = createRuntimeGoalEngine({

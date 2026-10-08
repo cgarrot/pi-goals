@@ -136,6 +136,11 @@ Rules:
   `.goals/outbox/` for a mesh relay to poll (pi-goals itself never calls
   the mesh — it stays standalone); private `agent:*` lanes never broadcast.
 
+Claim flows are attempt-first: `return_goal_todo_claim` and
+`validate_goal_todo_claim` resolve the owning goal BY ATTEMPT BINDING when
+exactly one goal holds the attempt; a provided `scope`/`goal_id` only
+disambiguates when the binding is absent or duplicated (M5).
+
 Concurrent agents already serialize safely: the file lock
 (`$TMPDIR/goals-<uid>/goals.lock`) is machine-global, and every engine
 mutation restores the full store inside the lock before appending.
@@ -197,7 +202,7 @@ window, the explicit `pauseGoal` engine mutation, and **scoped goals**
 
 ```bash
 npm run build     # tsc → dist/
-npm test          # build + node:test over dist/test (330 tests)
+npm test          # build + node:test over dist/test (335 tests)
 npm run smoke     # headless E2E demo against a temp store
 npm run cli -- list
 ```
@@ -222,10 +227,12 @@ the engine (stateless per mutation); `src/extension` is a thin Pi adapter;
 
 ## Status
 
-v0.2.0 — adds **scoped goals** for multi-agent swarms (local/agent/room
-lanes, `scope` tool param, `get_goals`, `--scope` commands, `$GOALS_SCOPE`
-session default, room outbox) on top of v0.1.0 Phase 1–6 (scaffold, core
-(tree/transition/completion/claims/proposal/CAS), store
-(streams/restore/snapshot), runtime engine (+ pause), Pi extension
-(20 tools + commands + HUD), CLI, smoke, skill, parity matrix). No
-commit/tag/publish until the tree review approves.
+v0.2.1 — scoped goals for multi-agent swarms (local/agent/room lanes,
+`scope` tool param, `get_goals`, `--scope` commands + CLI flag,
+`$GOALS_SCOPE` session default, room outbox with TTL prune) on top of
+v0.1.0 Phase 1–6 (scaffold, core, store, runtime engine, Pi extension
+(20 tools + commands + HUD), CLI, smoke, skill, parity matrix). v0.2.1
+hardening (review M1–M7): scopeLabel excluded from the create CAS hash
+(alias renames replay), outbox TTL prune, lazy mesh-identity refresh on
+`room` resolution (post-start joins), goal_id+scope coherence check,
+attempt-first claim docs, CLI `--scope`, swarm HUD lane.

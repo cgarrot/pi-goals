@@ -69,18 +69,32 @@ export default function goalsExtension(pi: ExtensionAPI, options: GoalsExtension
     // <meshStateDir>/identity-<sessionId>.json { alias, rooms } — absent
     // without mesh, never blocks the goals extension. Candidate dirs:
     // $MESH_STATE_DIR, the SESSION cwd (ctx.cwd when the host exposes it),
-    // the process cwd, then the stateDir parent.
+    // the process cwd, then the stateDir parent. meshDir is kept for lazy
+    // re-reads (M3): rooms joined later are picked up on room resolution.
     const sessionCwd = typeof (ctx as { cwd?: unknown }).cwd === "string" && ((ctx as { cwd: unknown }).cwd as string).length > 0 ? (ctx as { cwd: string }).cwd : process.cwd();
-    let meshIdentity: MeshIdentity | undefined;
-    for (const meshDir of [
+    const meshDirCandidates = [
       options.pathEnv?.MESH_STATE_DIR ?? process.env.MESH_STATE_DIR,
       path.join(sessionCwd, ".mesh"),
       path.join(process.cwd(), ".mesh"),
       path.join(path.dirname(stateDir), ".mesh"),
-    ]) {
-      if (typeof meshDir !== "string" || meshDir.trim().length === 0) continue;
-      meshIdentity = readMeshIdentity(meshDir, sessionId);
-      if (meshIdentity !== undefined) break;
+    ];
+    let meshIdentity: MeshIdentity | undefined;
+    let meshDir: string | undefined;
+    for (const candidate of meshDirCandidates) {
+      if (typeof candidate !== "string" || candidate.trim().length === 0) continue;
+      meshIdentity = readMeshIdentity(candidate, sessionId);
+      if (meshIdentity !== undefined) {
+        meshDir = candidate;
+        break;
+      }
+    }
+    if (meshDir === undefined) {
+      const fallback = meshDirCandidates.find((candidate): candidate is string => typeof candidate === "string" && candidate.trim().length > 0);
+      if (fallback !== undefined && typeof (options.pathEnv?.MESH_STATE_DIR ?? process.env.MESH_STATE_DIR) === "string") {
+        meshDir = (options.pathEnv?.MESH_STATE_DIR ?? process.env.MESH_STATE_DIR) as string;
+      } else if (fallback !== undefined) {
+        meshDir = fallback;
+      }
     }
     // $GOALS_SCOPE (opt-in session default, review P2/P3): canonicalized
     // ONCE here so every tool call without an explicit scope resolves the
@@ -108,6 +122,7 @@ export default function goalsExtension(pi: ExtensionAPI, options: GoalsExtension
       stateDir,
       runtimeDir,
       sessionId,
+      ...(meshDir !== undefined ? { meshDir } : {}),
       ...(meshIdentity !== undefined ? { meshIdentity } : {}),
       ...(scopeDefault !== undefined ? { scopeDefault } : {}),
       startedAt: Date.now(),

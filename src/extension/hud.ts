@@ -8,6 +8,7 @@
 import type { GoalTodoSummary } from "../core/tree.js";
 import type { GoalTodoNode } from "../core/types.js";
 import type { GoalRuntimeView } from "../runtime/engine.js";
+import { agentScopeFor } from "../shared/scope.js";
 import type { SessionContext } from "./pi-types.js";
 import type { GetRuntime, GoalActivationMode } from "./tools.js";
 
@@ -139,7 +140,22 @@ export class GoalsHud {
     const rt = this.deps.getRuntime();
     let view: GoalRuntimeView | undefined;
     try {
-      view = rt === null ? undefined : rt.engine.getGoal().goal;
+      if (rt !== null) {
+        // M7 (swarm HUD): show THIS session's lane first — the $GOALS_SCOPE
+        // default, then the private agent lane — and only fall back to the
+        // store-wide single-active view (solo contract) when neither has a
+        // goal. A multi-lane swarm keeps its HUD instead of hiding.
+        const lanes = [
+          rt.scopeDefault,
+          rt.scopeDefault === undefined ? agentScopeFor(rt.sessionId) : undefined,
+        ];
+        for (const lane of lanes) {
+          if (lane === undefined) continue;
+          view = rt.engine.getGoal(undefined, lane).goal;
+          if (view !== undefined) break;
+        }
+        if (view === undefined) view = rt.engine.getGoal().goal;
+      }
     } catch {
       view = undefined; // read failure -> hidden, never propagate
     }
