@@ -27,6 +27,7 @@ const EXPECTED_TOOLS = [
   "complete_goal_todo",
   "create_goal",
   "get_goal",
+  "get_goals",
   "get_goal_todos",
   "link_goal_todo_delegation",
   "propose_goal_completion",
@@ -164,10 +165,10 @@ function sha256(value: string): string {
 // Registration inventory
 // ---------------------------------------------------------------------------
 
-test("registers exactly the 19 zob-named tools (incl. delegation pair) plus /goal and /todo commands; no import_* tools", () => {
+test("registers exactly the 20 zob-named tools (incl. delegation pair + get_goals) plus /goal and /todo commands; no import_* tools", () => {
   const h = makeHarness();
   assert.deepEqual([...h.tools.keys()].sort(), [...EXPECTED_TOOLS].sort());
-  assert.equal(h.tools.size, 19);
+  assert.equal(h.tools.size, 20);
   assert.ok(h.commands.has("goal"), "/goal command registered");
   assert.ok(h.commands.has("todo"), "/todo command registered");
   for (const name of h.tools.keys()) {

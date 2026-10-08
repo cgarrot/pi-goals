@@ -12,6 +12,9 @@ import type { GoalRuntimeEngine, GoalRuntimeView } from "../runtime/engine.js";
 import type { LoopHooks } from "../runtime/ports.js";
 import type { TreePolicy } from "../core/tree.js";
 import { runtimeDir as resolveRuntimeDir, stateDir as resolveStateDir } from "../shared/paths.js";
+import { readMeshIdentity, resolveScopeShorthand } from "../shared/scope.js";
+import type { MeshIdentity } from "../shared/scope.js";
+import path from "node:path";
 import { registerCommands } from "./commands.js";
 import { GoalsHud } from "./hud.js";
 import type { ExtensionAPI } from "./pi-types.js";
@@ -61,6 +64,34 @@ export default function goalsExtension(pi: ExtensionAPI, options: GoalsExtension
   pi.on("session_start", (_event, ctx) => {
     const stateDir = options.stateDir ?? resolveStateDir(options.pathEnv);
     const runtimeDir = options.runtimeDir ?? resolveRuntimeDir(options.pathEnv);
+    const sessionId = ctx.sessionManager?.getSessionId() ?? "";
+    // SOFT mesh dependency (best effort): pi-mesh writes
+    // <meshStateDir>/identity-<sessionId>.json { alias, rooms } — absent
+    // without mesh, never blocks the goals extension. Candidate dirs:
+    // $MESH_STATE_DIR, the SESSION cwd (ctx.cwd when the host exposes it),
+    // the process cwd, then the stateDir parent.
+    const sessionCwd = typeof (ctx as { cwd?: unknown }).cwd === "string" && ((ctx as { cwd: unknown }).cwd as string).length > 0 ? (ctx as { cwd: string }).cwd : process.cwd();
+    let meshIdentity: MeshIdentity | undefined;
+    for (const meshDir of [
+      options.pathEnv?.MESH_STATE_DIR ?? process.env.MESH_STATE_DIR,
+      path.join(sessionCwd, ".mesh"),
+      path.join(process.cwd(), ".mesh"),
+      path.join(path.dirname(stateDir), ".mesh"),
+    ]) {
+      if (typeof meshDir !== "string" || meshDir.trim().length === 0) continue;
+      meshIdentity = readMeshIdentity(meshDir, sessionId);
+      if (meshIdentity !== undefined) break;
+    }
+    // $GOALS_SCOPE (opt-in session default, review P2/P3): canonicalized
+    // ONCE here so every tool call without an explicit scope resolves the
+    // same lane. Invalid value → warning + engine fallback (never crash).
+    let scopeDefault: string | undefined;
+    const rawScopeDefault = options.pathEnv?.GOALS_SCOPE ?? process.env.GOALS_SCOPE;
+    if (typeof rawScopeDefault === "string" && rawScopeDefault.trim().length > 0) {
+      const resolved = resolveScopeShorthand(rawScopeDefault, { sessionId, rooms: meshIdentity?.rooms });
+      if (resolved.ok) scopeDefault = resolved.scope;
+      else ctx.ui.notify(`goals: invalid $GOALS_SCOPE '${rawScopeDefault}' ignored (${resolved.error})`, { level: "warning" });
+    }
     const engine = createRuntimeGoalEngine({
       stateDir,
       runtimeDir,
@@ -76,7 +107,9 @@ export default function goalsExtension(pi: ExtensionAPI, options: GoalsExtension
       engine,
       stateDir,
       runtimeDir,
-      sessionId: ctx.sessionManager?.getSessionId() ?? "",
+      sessionId,
+      ...(meshIdentity !== undefined ? { meshIdentity } : {}),
+      ...(scopeDefault !== undefined ? { scopeDefault } : {}),
       startedAt: Date.now(),
       mode: DEFAULT_GOAL_ACTIVATION_MODE,
       mirrorWrites: 0,

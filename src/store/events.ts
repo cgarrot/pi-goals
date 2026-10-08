@@ -36,6 +36,7 @@ import {
 } from "../core/cas.js";
 import type { GoalMutationReceipt, GoalMutationToolName } from "../core/cas.js";
 import { isCanonicalGoalTodoId, isVisibleGoalTodoPath } from "../core/ids.js";
+import { isCanonicalGoalScope, isValidScopeLabel } from "../shared/scope.js";
 
 // ---------------------------------------------------------------------------
 // Schemas and ids
@@ -93,11 +94,17 @@ const PI_GOAL_STATUS_SET = new Set<string>([
 
 export const PI_GOAL_STATUSES: readonly PiGoalStatus[] = Object.freeze([...PI_GOAL_STATUS_SET] as PiGoalStatus[]);
 
-/** Persisted goal record (Phase 4 runtime owns transitions; the store owns shape). */
+/** Persisted goal record (Phase 4 runtime owns transitions; the store owns shape).
+ * Scope keys (v0.2) are OPTIONAL: pre-scope stores/streams parse unchanged
+ * and default to the "local" scope at read time (no file migration). */
 export interface GoalRecord {
   goalId: string;
   objective: string;
   status: PiGoalStatus;
+  /** Canonical scope (shared/scope.ts): local | agent:<id> | room:<id>. Absent = local. */
+  scope?: string;
+  /** Human-readable scope label (e.g. mesh alias); display-only. */
+  scopeLabel?: string;
   /** Embedded stream revision; must equal the envelope revision (restore-checked). */
   revision: number;
   createdAt: number;
@@ -370,13 +377,25 @@ function safeSnapshotFileName(value: unknown): value is string {
 // ---------------------------------------------------------------------------
 
 export function parseGoalRecord(value: unknown): GoalRecord | undefined {
-  if (!isRecord(value) || !hasExactKeys(value, ["goalId", "objective", "status", "revision", "createdAt", "updatedAt"])) return undefined;
+  if (!isRecord(value) || !hasExactKeys(value, ["goalId", "objective", "status", "revision", "createdAt", "updatedAt"], ["scope", "scopeLabel"])) return undefined;
   if (!isCanonicalGoalId(value.goalId)) return undefined;
   if (!nonEmptyString(value.objective, MAX_OBJECTIVE_CHARS)) return undefined;
   const status = oneOf<PiGoalStatus>(value.status, PI_GOAL_STATUS_SET);
   if (!status) return undefined;
+  // optional scope keys (v0.2): strict charset, traversal-proof (shared/scope.ts pattern)
+  if (value.scope !== undefined && !isCanonicalGoalScope(value.scope)) return undefined;
+  if (value.scopeLabel !== undefined && !isValidScopeLabel(value.scopeLabel)) return undefined;
   if (!safeIntegerAtLeast(value.revision, 0) || !safeIntegerAtLeast(value.createdAt, 0) || !safeIntegerAtLeast(value.updatedAt, 0)) return undefined;
-  return { goalId: value.goalId, objective: value.objective, status, revision: value.revision, createdAt: value.createdAt, updatedAt: value.updatedAt };
+  return {
+    goalId: value.goalId,
+    objective: value.objective,
+    status,
+    ...(value.scope !== undefined ? { scope: value.scope } : {}),
+    ...(value.scopeLabel !== undefined ? { scopeLabel: value.scopeLabel } : {}),
+    revision: value.revision,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
 }
 
 const TODO_STATUS_SET = new Set<string>(GOAL_TODO_STATUSES);

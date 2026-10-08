@@ -143,7 +143,10 @@ function requireActiveGoal(store: StoreView, goalId: string | undefined): { goal
     return match;
   }
   const open = store.goals.filter((entry) => entry.restored.goal?.status !== "complete");
-  if (open.length > 1) fail(`multiple non-complete goals exist: ${open.map((entry) => entry.goalId).sort().join(", ")}`);
+  if (open.length > 1) {
+    const lanes = open.map((entry) => `${entry.goalId} [${entry.restored.goal?.scope ?? "local"}]`).sort();
+    fail(`multiple non-complete goals exist: ${lanes.join(", ")} — pass an explicit goalId (scopes: ${[...new Set(open.map((entry) => entry.restored.goal?.scope ?? "local"))].sort().join(", ")})`);
+  }
   if (open.length === 1) return open[0];
   // no open goal: fall back to the most recently updated complete goal (clear semantics)
   let best: { goalId: string; restored: RestoredGoalStore } | undefined;
@@ -218,7 +221,8 @@ function main(): void {
     const sorted = [...store.goals].sort((a, b) => (a.restored.goal?.createdAt ?? 0) - (b.restored.goal?.createdAt ?? 0));
     for (const entry of sorted) {
       const goal = entry.restored.goal;
-      process.stdout.write(`${entry.goalId}  ${goal?.status ?? "?"}  rev ${entry.restored.revisions.goal}  todos ${entry.restored.todoGraph.nodes.length}  ${goal?.objective ?? ""}\n`);
+      const scope = goal?.scope ?? "local";
+      process.stdout.write(`${entry.goalId}  [${scope}]  ${goal?.status ?? "?"}  rev ${entry.restored.revisions.goal}  todos ${entry.restored.todoGraph.nodes.length}  ${goal?.objective ?? ""}\n`);
     }
     return;
   }

@@ -1,6 +1,6 @@
 {
   "name": "pi-goals-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Standalone Pi extension for parent-owned goal/TODO work graphs with delegated claims, CAS receipts, and oracle-gated completion. Zero runtime dependencies.",
   "type": "module",
   "license": "MIT",

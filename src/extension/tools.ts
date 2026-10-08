@@ -16,11 +16,15 @@
 
 import type { GoalMutationGuardInput, GoalMutationReceipt } from "../core/cas.js";
 import type { AddGoalTodoNodeItem } from "../core/tree.js";
-import type { GoalRuntimeEngine, GoalEngineError, GoalRuntimeView } from "../runtime/engine.js";
+import type { GoalRuntimeEngine, GoalEngineError, GoalRuntimeView, GoalSelector, GoalOverviewEntry } from "../runtime/engine.js";
+import type { MeshIdentity, ScopeShorthandResult } from "../shared/scope.js";
+import { resolveScopeShorthand } from "../shared/scope.js";
 import type { ExtensionAPI, ToolResult } from "./pi-types.js";
 import { textResult } from "./pi-types.js";
 import { renderGoalTodoTree } from "./hud.js";
 import { mirrorGoalEvent } from "./session-mirror.js";
+import { writeScopeOutboxEvent } from "./outbox.js";
+import type { GoalOutboxKind } from "./outbox.js";
 
 // ---------------------------------------------------------------------------
 // Shared runtime (built at session_start in index.ts)
@@ -36,6 +40,10 @@ export interface GoalsRuntime {
   readonly runtimeDir: string;
   /** Pi session id — stable across /reload. */
   readonly sessionId: string;
+  /** Best-effort pi-mesh identity (alias/rooms) read at session_start; absent without mesh. */
+  readonly meshIdentity?: MeshIdentity;
+  /** Canonical default scope from $GOALS_SCOPE (opt-in; undefined = engine fallback). */
+  readonly scopeDefault?: string;
   readonly startedAt: number;
   /** Session-level activation mode (zob /goal mode parity). */
   mode: GoalActivationMode;
@@ -50,6 +58,7 @@ export const GOAL_TOOL_NAMES: readonly string[] = Object.freeze([
   "create_goal",
   "resume_goal",
   "get_goal",
+  "get_goals",
   "get_goal_todos",
   "add_goal_todo",
   "add_goal_todos",
@@ -149,6 +158,21 @@ function mirrorMutation(
   else rt.mirrorFailures += 1;
 }
 
+/** Room-scope lifecycle events → file outbox for pi-mesh relay (best effort,
+ * outbox.ts); private agent lanes and local lanes never broadcast. */
+function outboxMutation(rt: GoalsRuntime, kind: GoalOutboxKind, goalId: string, scope: string | undefined, receipt: GoalMutationReceipt, extra: { status?: string; revision?: number } = {}): void {
+  if (scope === undefined) return;
+  writeScopeOutboxEvent(rt.stateDir, {
+    kind,
+    goalId,
+    scope,
+    mutationId: receipt.mutationId,
+    at: Date.now(),
+    ...(extra.status !== undefined ? { status: extra.status } : {}),
+    ...(extra.revision !== undefined ? { revision: extra.revision } : {}),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Param parsing (every failure names the exact parameter)
 // ---------------------------------------------------------------------------
@@ -233,6 +257,44 @@ function parseRef(params: Record<string, unknown>): { ref?: { todoId?: string; t
   return { ref: { ...(todoId !== undefined ? { todoId } : {}), ...(todoPath !== undefined ? { todoPath } : {}) } };
 }
 
+// ---------------------------------------------------------------------------
+// Scope plumbing (multi-agent stores — see shared/scope.ts)
+// ---------------------------------------------------------------------------
+
+/** Resolve a scope argument against this session (shorthands agent/room).
+ * Absent value → the $GOALS_SCOPE session default (already canonical). */
+function resolveScopeValue(rt: GoalsRuntime, value: unknown, parameter: string): { ok: true; scope?: string } | { ok: false; result: ToolResult } {
+  if (value === undefined) {
+    return rt.scopeDefault === undefined ? { ok: true } : { ok: true, scope: rt.scopeDefault };
+  }
+  if (typeof value !== "string") return { ok: false, result: fixInput(parameter, `parameter '${parameter}' must be a string scope (local | agent | room | room:<id> | agent:<id>)`) };
+  const resolved: ScopeShorthandResult = resolveScopeShorthand(value, { sessionId: rt.sessionId, rooms: rt.meshIdentity?.rooms });
+  if (!resolved.ok) return { ok: false, result: fixInput(parameter, `parameter '${parameter}': ${resolved.error}`) };
+  return { ok: true, scope: resolved.scope };
+}
+
+/** Mutation target selector from params: goal_id wins, else scope, else the
+ * session default scope, else the engine's exactly-one-active fallback. */
+function parseGoalTarget(rt: GoalsRuntime, params: Record<string, unknown>): { ok: true; selector?: GoalSelector } | { ok: false; result: ToolResult } {
+  const goalId = params.goal_id;
+  if (goalId !== undefined) {
+    if (typeof goalId !== "string" || goalId.trim().length === 0) {
+      return { ok: false, result: fixInput("goal_id", "parameter 'goal_id' must be a non-empty goal id") };
+    }
+    return { ok: true, selector: { goalId } };
+  }
+  const scope = resolveScopeValue(rt, params.scope, "scope");
+  if (!scope.ok) return scope;
+  return { ok: true, ...(scope.scope !== undefined ? { selector: { scope: scope.scope } } : {}) };
+}
+
+/** Compact scope suffix for one-liners; empty for legacy/local goals so
+ * solo output stays byte-identical with pre-scope stores. */
+function scopeSuffix(scope: string | undefined, label?: string): string {
+  if (scope === undefined || scope === "local") return "";
+  return ` [${scope}${label !== undefined && label.length > 0 ? ` · ${label}` : ""}]`;
+}
+
 function parseTodoItem(record: Record<string, unknown>, label: string): { ok: true; item: AddGoalTodoNodeItem } | { ok: false; result: ToolResult } {
   const title = record.title;
   if (typeof title !== "string" || title.trim().length === 0) {
@@ -271,10 +333,10 @@ function parseTodoItem(record: Record<string, unknown>, label: string): { ok: tr
 }
 
 /** Read the current view; surface restore-blocked / no-goal as engine-style errors. */
-function readView(rt: GoalsRuntime, goalId?: string): { view?: GoalRuntimeView; error?: ToolResult } {
+function readView(rt: GoalsRuntime, goalId?: string, scope?: string): { view?: GoalRuntimeView; error?: ToolResult } {
   let read: ReturnType<GoalRuntimeEngine["getGoal"]>;
   try {
-    read = rt.engine.getGoal(goalId);
+    read = rt.engine.getGoal(goalId, scope);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { error: engineFailure(syntheticError("store_write_failed", `goal store read failed: ${message}`, "after_context_change")) };
@@ -285,6 +347,17 @@ function readView(rt: GoalsRuntime, goalId?: string): { view?: GoalRuntimeView; 
   }
   if (read.goal === undefined) return {};
   return { view: read.goal };
+}
+
+/** Active lanes of the store (get_goals overview), sorted oldest-first. */
+function activeLanes(rt: GoalsRuntime): GoalOverviewEntry[] | undefined {
+  try {
+    const overview = rt.engine.getGoalsOverview();
+    if (overview.diagnostics !== undefined && overview.diagnostics.length > 0) return undefined;
+    return (overview.overview ?? []).filter((entry) => entry.status !== "complete");
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +389,7 @@ export function formatGoalStatusLines(view: GoalRuntimeView, mode: GoalActivatio
   const summary = view.summary;
   const percent = Math.round(summary.progress * 100);
   const lines = [
-    `goal ${goal.goalId} ${goal.status} (revision ${view.revisions.goal})`,
+    `goal ${goal.goalId} ${goal.status} (revision ${view.revisions.goal})${scopeSuffix(goal.scope, goal.scopeLabel)}`,
     `objective: ${goal.objective}`,
     `todos: ${summary.done}/${summary.total} done · open ${summary.open} · blocked ${summary.blocked.length} · progress ${percent}%`,
     `usage: turns ${goal.usage.turnsUsed}/${goal.loop.maxTurns} · tokens ${goal.usage.tokensUsed}`,
@@ -342,20 +415,39 @@ async function execCreateGoal(getRuntime: GetRuntime, params: Record<string, unk
   }
   const maxTurns = intParam(params.max_turns, "max_turns", 1);
   if (maxTurns.error) return maxTurns.error;
+  const scope = resolveScopeValue(rt, params.scope, "scope");
+  if (!scope.ok) return scope.result;
+  // scope label: the mesh alias rides along for display (agent lanes).
+  let scopeLabel: string | undefined;
+  if (scope.scope !== undefined && scope.scope.startsWith("agent:") && rt.meshIdentity !== undefined) {
+    scopeLabel = rt.meshIdentity.alias;
+  }
   const casParsed = parseCasParam(params.cas);
   if (!casParsed.ok) return casParsed.result;
-  const outcome = rt.engine.createGoal(objective, casParsed.cas, maxTurns.value !== undefined ? { maxTurns: maxTurns.value } : undefined);
+  const outcome = rt.engine.createGoal(objective, casParsed.cas, {
+    ...(maxTurns.value !== undefined ? { maxTurns: maxTurns.value } : {}),
+    ...(scope.scope !== undefined ? { scope: scope.scope } : {}),
+    ...(scopeLabel !== undefined ? { scopeLabel } : {}),
+  });
   if (!outcome.ok) return engineFailure(outcome);
   const goal = outcome.result.goal;
   mirrorMutation(rt, "goal_created", outcome.receipt, { goalId: outcome.result.goalId, status: goal?.status, revision: goal?.revision });
+  outboxMutation(rt, "goal_created", outcome.result.goalId, goal?.scope, outcome.receipt, { status: goal?.status, revision: goal?.revision });
+  // Decision 1 (review P2): the default stays local — a detected mesh session
+  // only WARNS so solo behavior never changes implicitly.
+  const meshHint = params.scope === undefined && rt.scopeDefault === undefined && rt.meshIdentity !== undefined
+    ? ` — mesh session detected (alias ${rt.meshIdentity.alias}, rooms ${rt.meshIdentity.rooms.join(", ") || "none"}): pass scope 'agent' for a private lane or 'room:<id>' to share`
+    : "";
   return textResult(
-    `${outcome.status === "replayed" ? "replayed: " : ""}created ${outcome.result.goalId} (status ${goal?.status ?? "active"}, revision ${goal?.revision ?? 1})`,
+    `${outcome.status === "replayed" ? "replayed: " : ""}created ${outcome.result.goalId} (status ${goal?.status ?? "active"}, revision ${goal?.revision ?? 1})${scopeSuffix(goal?.scope, goal?.scopeLabel)}${meshHint}`,
     {
       schema: RESULT_SCHEMA,
       status: outcome.status,
       goalId: outcome.result.goalId,
       goalStatus: goal?.status,
       revision: goal?.revision,
+      ...(goal?.scope !== undefined ? { scope: goal.scope } : {}),
+      ...(goal?.scopeLabel !== undefined ? { scopeLabel: goal.scopeLabel } : {}),
       cas: casOf(outcome),
     },
   );
@@ -379,10 +471,11 @@ async function execResumeGoal(getRuntime: GetRuntime, params: Record<string, unk
   }
   const casParsed = parseCasParam(params.cas);
   if (!casParsed.ok) return casParsed.result;
-  const outcome = rt.engine.resumeGoal(reason, casParsed.cas, extraTurns.value);
+  const outcome = rt.engine.resumeGoal(reason, casParsed.cas, extraTurns.value, typeof goalId === "string" && goalId.trim().length > 0 ? { goalId } : undefined);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, "goal_resumed", outcome.receipt, { goalId: result.goal.goalId, status: result.goal.status, revision: result.goal.revision });
+  outboxMutation(rt, "goal_resumed", result.goal.goalId, result.goal.scope, outcome.receipt, { status: result.goal.status, revision: result.goal.revision });
   return textResult(
     `${outcome.status === "replayed" ? "replayed: " : ""}resumed ${result.goal.goalId} (was ${result.previousStatus}, now ${result.goal.status}, revision ${result.goal.revision})`,
     {
@@ -404,8 +497,10 @@ async function execGetGoal(getRuntime: GetRuntime, params: Record<string, unknow
   if (goalId !== undefined && (typeof goalId !== "string" || goalId.trim().length === 0)) {
     return fixInput("goal_id", "parameter 'goal_id' must be a non-empty goal id");
   }
+  const scope = resolveScopeValue(rt, params.scope, "scope");
+  if (!scope.ok) return scope.result;
   const requestedGoalId = typeof goalId === "string" && goalId.trim().length > 0 ? goalId : undefined;
-  const read = readView(rt, requestedGoalId);
+  const read = readView(rt, requestedGoalId, scope.scope);
   if (read.error) return read.error;
   if (read.view === undefined) {
     // batch-#2 fix: a PROVIDED but unknown goal id is its own precise
@@ -416,6 +511,17 @@ async function execGetGoal(getRuntime: GetRuntime, params: Record<string, unknow
         status: "not_found",
         goalId: requestedGoalId,
       });
+    }
+    // scope-aware ambiguity (review P6): several active lanes and no
+    // goal_id/scope → name them instead of lying "no active goal".
+    if (scope.scope === undefined) {
+      const lanes = activeLanes(rt);
+      if (lanes !== undefined && lanes.length > 1) {
+        return textResult(
+          `scope_ambiguous: ${lanes.length} active goals across scopes — ${lanes.map((lane) => `${lane.goalId} ${lane.scope}`).join(" · ")}; pass goal_id or scope`,
+          { schema: RESULT_SCHEMA, status: "error", code: "scope_ambiguous", retryPolicy: "fix_input", lanes: lanes.map((lane) => ({ goalId: lane.goalId, scope: lane.scope })) },
+        );
+      }
     }
     return textResult("no active goal — create one with create_goal (or /goal <objective>)", {
       schema: RESULT_SCHEMA,
@@ -430,6 +536,8 @@ async function execGetGoal(getRuntime: GetRuntime, params: Record<string, unknow
     goalId: goal.goalId,
     revision: view.revisions.goal,
     objective: goal.objective,
+    ...(goal.scope !== undefined ? { scope: goal.scope } : {}),
+    ...(goal.scopeLabel !== undefined ? { scopeLabel: goal.scopeLabel } : {}),
     revisions: view.revisions,
     summary: {
       total: view.summary.total,
@@ -448,6 +556,49 @@ async function execGetGoal(getRuntime: GetRuntime, params: Record<string, unknow
   });
 }
 
+async function execGetGoals(getRuntime: GetRuntime, _params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return blockedSession();
+  let overview: ReturnType<GoalRuntimeEngine["getGoalsOverview"]>;
+  try {
+    overview = rt.engine.getGoalsOverview();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return engineFailure(syntheticError("store_write_failed", `goal store read failed: ${message}`, "after_context_change"));
+  }
+  if (overview.diagnostics !== undefined && overview.diagnostics.length > 0) {
+    const first = overview.diagnostics[0]!;
+    return engineFailure(syntheticError("restore_blocked", `${overview.diagnostics.length} restore diagnostic(s); first: [${first.stream}] ${first.message}`, "after_context_change"));
+  }
+  const entries = overview.overview ?? [];
+  if (entries.length === 0) {
+    return textResult("no goals in the store", { schema: RESULT_SCHEMA, status: "no_goal", goals: [] });
+  }
+  const active = entries.filter((entry) => entry.status !== "complete");
+  const lines = [
+    `goals: ${active.length} active / ${entries.length} total`,
+    ...entries.map((entry) => {
+      const trimmedObjective = entry.objective.length > 60 ? `${entry.objective.slice(0, 57)}…` : entry.objective;
+      return `${entry.status === "complete" ? "✓" : entry.status === "active" ? "◆" : "·"} ${entry.goalId} [${entry.scope}${entry.scopeLabel !== undefined ? ` · ${entry.scopeLabel}` : ""}] ${entry.status} rev ${entry.revision} todos ${entry.todos} — ${trimmedObjective}`;
+    }),
+  ];
+  return textResult(lines.join("\n"), {
+    schema: RESULT_SCHEMA,
+    status: "ok",
+    activeCount: active.length,
+    totalCount: entries.length,
+    goals: entries.map((entry) => ({
+      goal_id: entry.goalId,
+      scope: entry.scope,
+      ...(entry.scopeLabel !== undefined ? { scope_label: entry.scopeLabel } : {}),
+      status: entry.status,
+      revision: entry.revision,
+      todos: entry.todos,
+      objective: entry.objective,
+    })),
+  });
+}
+
 async function execGetGoalTodos(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
   const rt = getRuntime();
   if (rt === null) return blockedSession();
@@ -455,7 +606,9 @@ async function execGetGoalTodos(getRuntime: GetRuntime, params: Record<string, u
   if (goalId !== undefined && (typeof goalId !== "string" || goalId.trim().length === 0)) {
     return fixInput("goal_id", "parameter 'goal_id' must be a non-empty goal id");
   }
-  const read = readView(rt, typeof goalId === "string" && goalId.trim().length > 0 ? goalId : undefined);
+  const scope = resolveScopeValue(rt, params.scope, "scope");
+  if (!scope.ok) return scope.result;
+  const read = readView(rt, typeof goalId === "string" && goalId.trim().length > 0 ? goalId : undefined, scope.scope);
   if (read.error) return read.error;
   if (read.view === undefined) {
     return textResult("no active goal — TODOs require an active goal", { schema: RESULT_SCHEMA, status: "no_goal" });
@@ -495,9 +648,11 @@ async function execGetGoalTodos(getRuntime: GetRuntime, params: Record<string, u
 async function execAddTodos(getRuntime: GetRuntime, params: Record<string, unknown>, items: readonly AddGoalTodoNodeItem[], casValue: unknown, kind: "add_goal_todo" | "add_goal_todos"): Promise<ToolResult> {
   const rt = getRuntime();
   if (rt === null) return blockedSession();
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
   const casParsed = parseCasParam(casValue);
   if (!casParsed.ok) return casParsed.result;
-  const outcome = rt.engine.addTodos(items, casParsed.cas);
+  const outcome = rt.engine.addTodos(items, casParsed.cas, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, kind === "add_goal_todo" ? "todo_added" : "todos_added", outcome.receipt, { todosRevision: result.todosRevision });
@@ -571,7 +726,9 @@ async function execUpdateGoalTodo(getRuntime: GetRuntime, params: Record<string,
   }
   const casParsed = parseCasParam(params.cas);
   if (!casParsed.ok) return casParsed.result;
-  const outcome = rt.engine.updateTodoMetadata(ref.ref!, patch, casParsed.cas);
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
+  const outcome = rt.engine.updateTodoMetadata(ref.ref!, patch, casParsed.cas, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, "todo_updated", outcome.receipt, { todosRevision: result.todosRevision });
@@ -624,7 +781,9 @@ async function execResolveTodo(getRuntime: GetRuntime, params: Record<string, un
   if (auto.error) return auto.error;
   const casParsed = parseCasParam(params.cas);
   if (!casParsed.ok) return casParsed.result;
-  const outcome = rt.engine.resolveTodo(ref.ref!, actionValue as Parameters<typeof rt.engine.resolveTodo>[1], input as Parameters<typeof rt.engine.resolveTodo>[2], casParsed.cas);
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
+  const outcome = rt.engine.resolveTodo(ref.ref!, actionValue as Parameters<typeof rt.engine.resolveTodo>[1], input as Parameters<typeof rt.engine.resolveTodo>[2], casParsed.cas, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, "todo_resolved", outcome.receipt, { todosRevision: result.todosRevision });
@@ -679,7 +838,11 @@ async function execSplitGoalTodo(getRuntime: GetRuntime, params: Record<string, 
   if (!Array.isArray(titles) || titles.length === 0 || titles.some((title) => typeof title !== "string" || title.trim().length === 0)) {
     return fixInput("titles", "parameter 'titles' must be a non-empty array of non-empty child title strings");
   }
-  const read = readView(rt);
+  const casParsed = parseCasParam(params.cas);
+  if (!casParsed.ok) return casParsed.result;
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
+  const read = readView(rt, target.selector?.goalId, target.selector?.scope);
   if (read.error) return read.error;
   if (read.view === undefined) {
     return engineFailure(syntheticError("goal_missing", "no active (non-complete) goal exists", "fix_input"));
@@ -695,9 +858,7 @@ async function execSplitGoalTodo(getRuntime: GetRuntime, params: Record<string, 
     parentId: parent.id,
     input: { title: title.trim(), required: true },
   }));
-  const casParsed = parseCasParam(params.cas);
-  if (!casParsed.ok) return casParsed.result;
-  const outcome = rt.engine.addTodos(items, casParsed.cas);
+  const outcome = rt.engine.addTodos(items, casParsed.cas, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, "todo_split", outcome.receipt, { todosRevision: result.todosRevision });
@@ -738,13 +899,15 @@ async function execLinkGoalTodoDelegation(getRuntime: GetRuntime, params: Record
   if (depth.error) return depth.error;
   const casParsed = parseCasParam(params.cas);
   if (!casParsed.ok) return casParsed.result;
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
   const outcome = rt.engine.linkDelegation(ref.ref!, {
     ...(attemptId !== undefined ? { attemptId } : {}),
     ...(runId !== undefined ? { runId } : {}),
     ...(agent !== undefined ? { agent } : {}),
     ...(policy.value !== undefined ? { validationPolicy: policy.value } : {}),
     ...(depth.value !== undefined ? { delegationDepth: depth.value } : {}),
-  }, casParsed.cas);
+  }, casParsed.cas, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, "delegation_linked", outcome.receipt, { todosRevision: undefined });
@@ -788,13 +951,15 @@ async function execReturnGoalTodoClaim(getRuntime: GetRuntime, params: Record<st
   if (noShip.error) return noShip.error;
   const casParsed = parseCasParam(params.cas);
   if (!casParsed.ok) return casParsed.result;
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
   const outcome = rt.engine.returnClaim(attemptId, {
     ...(claimText !== undefined ? { claimText } : {}),
     ...(claimHash.value !== undefined ? { claimHash: claimHash.value } : {}),
     ...(evidenceRefs.values !== undefined ? { evidenceRefs: evidenceRefs.values } : {}),
     ...(validationCommands.values !== undefined ? { validationCommands: validationCommands.values } : {}),
     ...(noShip.value !== undefined ? { noShip: noShip.value } : {}),
-  }, casParsed.cas);
+  }, casParsed.cas, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, "claim_returned", outcome.receipt, {});
@@ -854,12 +1019,30 @@ async function execValidateGoalTodoClaim(getRuntime: GetRuntime, params: Record<
 
   // Adapter-side binding echo (zob parity): the exact returned claim must
   // match claim_hash / expected_validation_policy before the engine records.
-  const read = readView(rt);
-  if (read.error) return read.error;
-  if (read.view === undefined) {
-    return engineFailure(syntheticError("goal_missing", "no active (non-complete) goal exists", "fix_input"));
+  // Scope-aware (review): the claim may live on ANY lane (room goals); the
+  // default view is tried first, then every active lane's goal.
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
+  const claimCandidates: GoalRuntimeView[] = [];
+  const primary = readView(rt, target.selector?.goalId, target.selector?.scope);
+  if (primary.error) return primary.error;
+  if (primary.view !== undefined) claimCandidates.push(primary.view);
+  if (primary.view?.claims.claims[attemptId] === undefined) {
+    for (const lane of activeLanes(rt) ?? []) {
+      if (primary.view !== undefined && lane.goalId === primary.view.goal.goalId) continue;
+      const laneRead = readView(rt, lane.goalId);
+      if (laneRead.error !== undefined || laneRead.view === undefined) continue;
+      if (laneRead.view.claims.claims[attemptId] !== undefined) {
+        claimCandidates.push(laneRead.view);
+        break;
+      }
+    }
   }
-  const claim = read.view.claims.claims[attemptId];
+  const claimView = claimCandidates.find((candidate) => candidate.claims.claims[attemptId] !== undefined);
+  if (claimView === undefined) {
+    return engineFailure(syntheticError("goal_missing", `no active (non-complete) goal holds attempt ${attemptId}`, "fix_input"));
+  }
+  const claim = claimView.claims.claims[attemptId]!;
   if (claim === undefined) {
     return fixInput("expected_attempt_id", `parameter 'expected_attempt_id': no returned claim exists for attempt ${attemptId}`);
   }
@@ -883,7 +1066,7 @@ async function execValidateGoalTodoClaim(getRuntime: GetRuntime, params: Record<
     ...(validationCommands.values !== undefined ? { validationCommands: validationCommands.values } : {}),
     ...(agent !== undefined ? { agent } : {}),
     ...(runId !== undefined ? { runId } : {}),
-  }, casParsed.cas);
+  }, casParsed.cas, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, "claim_validated", outcome.receipt, {});
@@ -936,6 +1119,8 @@ async function execProposeCompletion(getRuntime: GetRuntime, params: Record<stri
   if (noShip.value === undefined) return fixInput("no_ship", "parameter 'no_ship' (boolean) is required — true blocks the proposal");
   const casParsed = parseCasParam(params.cas);
   if (!casParsed.ok) return casParsed.result;
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
   const outcome = rt.engine.proposeCompletion({
     completionSummary: summary,
     requirementsChecked: fields.requirements_checked!,
@@ -943,11 +1128,12 @@ async function execProposeCompletion(getRuntime: GetRuntime, params: Record<stri
     validationCommands: fields.validation_commands!,
     knownRisks: fields.known_risks!,
     noShip: noShip.value,
-  }, casParsed.cas);
+  }, casParsed.cas, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   const proposal = result.proposal;
   mirrorMutation(rt, "completion_proposed", outcome.receipt, { goalId: result.goal.goalId, status: result.goal.status, revision: result.goal.revision });
+  outboxMutation(rt, "completion_proposed", result.goal.goalId, result.goal.scope, outcome.receipt, { status: result.goal.status, revision: result.goal.revision });
   return textResult(
     `${outcome.status === "replayed" ? "replayed: " : ""}proposal ready (goal → ${result.goal.status}, revision ${result.goal.revision}) — proposalHash ${proposal?.proposalHash.slice(0, 12) ?? "?"}…`,
     {
@@ -982,8 +1168,10 @@ async function execRecordOracle(getRuntime: GetRuntime, params: Record<string, u
   if (expected.error) return expected.error;
   if (expected.value === undefined) return fixInput("expected_proposal_hash", "parameter 'expected_proposal_hash' (exact proposal sha256) is required");
 
-  // zob parity: the oracle echoes the EXACT bound proposal hash.
-  const read = readView(rt);
+  // zob parity: the oracle echoes the EXACT bound proposal hash (scope-aware read).
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
+  const read = readView(rt, target.selector?.goalId, target.selector?.scope);
   if (read.error) return read.error;
   const proposal = read.view?.goal.completionProposal;
   if (proposal === undefined) {
@@ -1000,10 +1188,11 @@ async function execRecordOracle(getRuntime: GetRuntime, params: Record<string, u
     noShip: noShip.value,
     evidenceSummary,
     ...(evidenceRefs.values !== undefined ? { evidenceRefs: evidenceRefs.values } : {}),
-  }, casParsed.cas);
+  }, casParsed.cas, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, "oracle_recorded", outcome.receipt, { goalId: result.goal.goalId, status: result.goal.status, revision: result.goal.revision });
+  outboxMutation(rt, "oracle_recorded", result.goal.goalId, result.goal.scope, outcome.receipt, { status: result.goal.status, revision: result.goal.revision });
   return textResult(
     `${outcome.status === "replayed" ? "replayed: " : ""}oracle ${result.decision.verdict} recorded (goal ${result.goal.status}, revision ${result.goal.revision}) — decisionHash ${result.decision.oracleDecisionHash.slice(0, 12)}…`,
     {
@@ -1034,13 +1223,16 @@ async function execUpdateGoal(getRuntime: GetRuntime, params: Record<string, unk
   if (decisionHash.value === undefined) return fixInput("expected_oracle_decision_hash", "parameter 'expected_oracle_decision_hash' (exact decision sha256) is required");
   const casParsed = parseCasParam(params.cas);
   if (!casParsed.ok) return casParsed.result;
+  const target = parseGoalTarget(rt, params);
+  if (!target.ok) return target.result;
   const outcome = rt.engine.completeGoal(casParsed.cas, {
     expectedProposalHash: proposalHash.value,
     expectedOracleDecisionHash: decisionHash.value,
-  });
+  }, target.selector);
   if (!outcome.ok) return engineFailure(outcome);
   const result = outcome.result;
   mirrorMutation(rt, "goal_completed", outcome.receipt, { goalId: result.goal.goalId, status: result.goal.status, revision: result.goal.revision });
+  outboxMutation(rt, "goal_completed", result.goal.goalId, result.goal.scope, outcome.receipt, { status: result.goal.status, revision: result.goal.revision });
   return textResult(
     `${outcome.status === "replayed" ? "replayed: " : ""}goal ${result.goal.goalId} complete (revision ${result.goal.revision})`,
     {
@@ -1056,6 +1248,15 @@ async function execUpdateGoal(getRuntime: GetRuntime, params: Record<string, unk
 // ---------------------------------------------------------------------------
 // JSON Schema fragments
 // ---------------------------------------------------------------------------
+
+/** Goal-target parameters shared by every goal-scoped tool: goal_id
+ * (explicit cross-scope addressing) or scope (local | agent | room |
+ * room:<id> | agent:<id>). Absent both → the engine's exactly-one-active
+ * fallback (solo contract, review P6). */
+const GOAL_TARGET_PARAMS: Record<string, unknown> = {
+  goal_id: { type: "string", description: "Optional explicit goal id (cross-scope addressing)." },
+  scope: { type: "string", description: "Optional goal scope: 'local' (solo), 'agent' (this session's private lane), 'room:<id>' (shared mesh room). 'room' alone works only when the session joined exactly one room." },
+};
 
 const CAS_SCHEMA: Record<string, unknown> = {
   type: "object",
@@ -1116,14 +1317,15 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
   pi.registerTool({
     name: "create_goal",
     label: "Create Goal",
-    description: "Create the runtime goal (single active goal). Returns the goal id and revision for CAS-guarded follow-up mutations.",
+    description: "Create the runtime goal (single active goal per scope: local solo lane, agent private lane, or room shared lane). Returns the goal id and revision for CAS-guarded follow-up mutations.",
     promptSnippet: "Start a runtime goal with a concrete objective.",
-    promptGuidelines: "One active goal at a time. cas.expected_goal_revision must be 0 for a fresh store. Read revisions from the result details for follow-up calls.",
+    promptGuidelines: "One active goal per scope. Solo default is the local lane; in a mesh swarm pass scope 'agent' (private) or 'room:<id>' (shared). cas.expected_goal_revision must be 0 for a fresh scope. Read revisions from the result details for follow-up calls.",
     parameters: {
       type: "object",
       properties: {
         objective: { type: "string", description: "Concrete objective to pursue until ready_for_oracle." },
         max_turns: { type: "integer", minimum: 1, description: "Optional positive turn cap for the continuation loop." },
+        scope: { type: "string", description: "Goal scope: 'local' (default, solo), 'agent' (this session's private lane), 'room:<id>' (shared mesh room). 'room' alone works only when the session joined exactly one room." },
         cas: CAS_SCHEMA,
       },
       required: ["objective"],
@@ -1151,12 +1353,20 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
   pi.registerTool({
     name: "get_goal",
     label: "Get Goal",
-    description: "Show the active (or given) runtime goal: status, objective, TODO summary, usage, oracle binding, and the next safe action.",
+    description: "Show the active (or given) runtime goal: status, objective, TODO summary, usage, oracle binding, and the next safe action. Pass goal_id or scope when several lanes are active.",
     parameters: {
       type: "object",
-      properties: { goal_id: { type: "string", description: "Optional goal id. Defaults to the active goal." } },
+      properties: { ...GOAL_TARGET_PARAMS },
     },
     execute: fire(execGetGoal),
+  });
+
+  pi.registerTool({
+    name: "get_goals",
+    label: "Get Goals",
+    description: "List every goal in the store with its scope (multi-agent overview): one line per goal, active lanes flagged, so scope-ambiguous stores can be disambiguated.",
+    parameters: { type: "object", properties: {} },
+    execute: fire(execGetGoals),
   });
 
   pi.registerTool({
@@ -1171,7 +1381,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
       // and either ref narrows the view (enforced by the executor).
       type: "object",
       properties: {
-        goal_id: { type: "string", description: "Optional goal id. Defaults to the active goal." },
+        ...GOAL_TARGET_PARAMS,
         ...REF_SCHEMA_OPTIONAL,
       },
     },
@@ -1182,7 +1392,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
     name: "add_goal_todo",
     label: "Add Goal Todo",
     description: "Add ONE TODO to the active goal. Prefer add_goal_todos for plans (single atomic batch).",
-    parameters: { type: "object", properties: { ...TODO_ITEM_SCHEMA, cas: CAS_SCHEMA }, required: ["title"] },
+    parameters: { type: "object", properties: { ...TODO_ITEM_SCHEMA, scope: GOAL_TARGET_PARAMS.scope, cas: CAS_SCHEMA }, required: ["title"] },
     execute: fire(execAddGoalTodo),
   });
 
@@ -1194,6 +1404,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
       type: "object",
       properties: {
         todos: { type: "array", items: { type: "object", properties: TODO_ITEM_SCHEMA, required: ["title"] }, description: "Bounded TODO nodes to add." },
+        scope: GOAL_TARGET_PARAMS.scope,
         cas: CAS_SCHEMA,
       },
       required: ["todos"],
@@ -1209,6 +1420,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
       type: "object",
       properties: {
         ...REF_SCHEMA,
+        scope: GOAL_TARGET_PARAMS.scope,
         status: { type: "string", description: "REJECTED if present — status transitions go through resolve_goal_todo (or complete_goal_todo / block_goal_todo)." },
         title: { type: "string", description: "Replacement title." },
         owner: { type: "string", enum: [...GOAL_TODO_OWNER_VALUES], description: "New owner." },
@@ -1238,6 +1450,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
         reason: { type: "string", description: "Required for block/reject_claim/reopen; skip reason for skip." },
         user_resolved: { type: "boolean", description: "Parent acknowledgement that a needs_user requirement was resolved." },
         goal_id: { type: "string", description: "Optional goal id. Defaults to the active goal." },
+        scope: GOAL_TARGET_PARAMS.scope,
         cas: CAS_SCHEMA,
       },
       required: ["action"],
@@ -1255,6 +1468,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
         ...REF_SCHEMA,
         skipped: { type: "boolean", description: "Mark skipped instead of done." },
         reason: { type: "string", description: "Skip reason when skipped=true." },
+        ...GOAL_TARGET_PARAMS,
         cas: CAS_SCHEMA,
       },
       required: [],
@@ -1268,7 +1482,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
     description: "Mark a TODO blocked with a non-empty blocker reason.",
     parameters: {
       type: "object",
-      properties: { ...REF_SCHEMA, reason: { type: "string", description: "Blocker reason." }, cas: CAS_SCHEMA },
+      properties: { ...REF_SCHEMA, reason: { type: "string", description: "Blocker reason." }, ...GOAL_TARGET_PARAMS, cas: CAS_SCHEMA },
       required: ["reason"],
     },
     execute: fire(execBlockGoalTodo),
@@ -1280,7 +1494,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
     description: "Split a TODO into required child subtodos (one atomic batch under the resolved parent).",
     parameters: {
       type: "object",
-      properties: { ...REF_SCHEMA, titles: { type: "array", items: { type: "string" }, description: "Child TODO titles." }, cas: CAS_SCHEMA },
+      properties: { ...REF_SCHEMA, titles: { type: "array", items: { type: "string" }, description: "Child TODO titles." }, ...GOAL_TARGET_PARAMS, cas: CAS_SCHEMA },
       required: ["titles"],
     },
     execute: fire(execSplitGoalTodo),
@@ -1299,6 +1513,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
         agent: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$", description: "Optional delegated agent name." },
         validation_policy: { type: "string", enum: ["parent_review", "oracle_required"], description: "Claim validation policy frozen at launch. Default parent_review." },
         delegation_depth: { type: "integer", minimum: 1, description: "Parent-owned delegation depth metadata. Default 1." },
+        ...GOAL_TARGET_PARAMS,
         cas: CAS_SCHEMA,
       },
       required: [],
@@ -1319,6 +1534,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
         evidence_refs: { type: "array", items: { type: "string" }, description: "Claim evidence refs." },
         validation_commands: { type: "array", items: { type: "string" }, description: "Claim validation commands." },
         no_ship: { type: "boolean", description: "True when the child flags a no-ship condition." },
+        ...GOAL_TARGET_PARAMS,
         cas: CAS_SCHEMA,
       },
       required: ["expected_attempt_id"],
@@ -1347,6 +1563,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
         validation_commands: { type: "array", items: { type: "string" }, description: "Validation commands checked by the oracle." },
         agent: { type: "string", description: "Oracle agent name. Default oracle." },
         run_id: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$", description: "Optional provenance run id persisted with the validation." },
+        ...GOAL_TARGET_PARAMS,
         cas: CAS_SCHEMA,
       },
       required: ["verdict", "recommended_action", "no_ship", "confidence", "claim_hash", "expected_attempt_id", "expected_validation_policy", "output_hash"],
@@ -1360,7 +1577,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
     description: "Accept a returned delegation claim (exact binding echo required). Surfaces the settlement and the strict-PASS composition.",
     parameters: {
       type: "object",
-      properties: { ...REF_SCHEMA, ...CLAIM_BINDING_SCHEMA, cas: CAS_SCHEMA },
+      properties: { ...REF_SCHEMA, ...CLAIM_BINDING_SCHEMA, ...GOAL_TARGET_PARAMS, cas: CAS_SCHEMA },
       required: ["expected_claim_hash", "expected_attempt_id", "expected_validation_policy"],
     },
     execute: fire((rt, params) => execSettleClaim(rt, params, "accept_claim")),
@@ -1372,7 +1589,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
     description: "Reject a returned delegation claim with a non-empty reason (exact binding echo required).",
     parameters: {
       type: "object",
-      properties: { ...REF_SCHEMA, ...CLAIM_BINDING_SCHEMA, reason: { type: "string", description: "Required parent rejection reason." }, cas: CAS_SCHEMA },
+      properties: { ...REF_SCHEMA, ...CLAIM_BINDING_SCHEMA, reason: { type: "string", description: "Required parent rejection reason." }, ...GOAL_TARGET_PARAMS, cas: CAS_SCHEMA },
       required: ["expected_claim_hash", "expected_attempt_id", "expected_validation_policy", "reason"],
     },
     execute: fire((rt, params) => execSettleClaim(rt, params, "reject_claim")),
@@ -1391,6 +1608,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
         validation_commands: { type: "array", items: { type: "string" }, description: "Validation commands run and checked." },
         known_risks: { type: "array", items: { type: "string" }, description: "Known remaining risks or blockers." },
         no_ship: { type: "boolean", description: "True if any no-ship blocker remains." },
+        scope: GOAL_TARGET_PARAMS.scope,
         cas: CAS_SCHEMA,
       },
       required: ["completion_summary", "requirements_checked", "evidence_refs", "validation_commands", "known_risks", "no_ship"],
@@ -1410,6 +1628,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
         evidence_summary: { type: "string", description: "Oracle evidence summary (only a hash is stored)." },
         evidence_refs: { type: "array", items: { type: "string" }, description: "Transient safe evidence refs (hash only)." },
         expected_proposal_hash: { type: "string", pattern: "^[a-f0-9]{64}$", description: "Exact sha256 of the bound completion proposal." },
+        scope: GOAL_TARGET_PARAMS.scope,
         cas: CAS_SCHEMA,
       },
       required: ["verdict", "no_ship", "evidence_summary", "expected_proposal_hash"],
@@ -1427,6 +1646,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime, onChange
         status: { type: "string", enum: ["complete"], description: "Only 'complete' is accepted." },
         expected_proposal_hash: { type: "string", pattern: "^[a-f0-9]{64}$", description: "Exact sha256 of the bound completion proposal." },
         expected_oracle_decision_hash: { type: "string", pattern: "^[a-f0-9]{64}$", description: "Exact sha256 of the bound oracle decision." },
+        scope: GOAL_TARGET_PARAMS.scope,
         cas: CAS_SCHEMA,
       },
       required: ["status", "expected_proposal_hash", "expected_oracle_decision_hash"],

@@ -37,6 +37,7 @@ import { validateOracleDecision } from "./oracle.js";
 import type { OracleDecision } from "./oracle.js";
 import { isCanonicalGoalId } from "../store/events.js";
 import type { GoalRecord } from "../store/events.js";
+import { isCanonicalGoalScope, isValidScopeLabel } from "../shared/scope.js";
 
 // ---------------------------------------------------------------------------
 // Defaults and vocabularies
@@ -134,6 +135,10 @@ export interface RuntimeGoal {
   readonly goalId: string;
   readonly objective: string;
   readonly status: RuntimeGoalStatus;
+  /** Canonical scope (local | agent:<id> | room:<id>); absent = local. */
+  readonly scope?: string;
+  /** Display-only scope label (e.g. mesh alias); absent = none. */
+  readonly scopeLabel?: string;
   readonly gate?: RuntimeGoalGate;
   readonly oracleDecision?: OracleDecision;
   readonly completionProposal?: GoalCompletionProposal;
@@ -158,7 +163,7 @@ const GOAL_REQUIRED_KEYS: readonly string[] = Object.freeze([
   "createdAt",
   "updatedAt",
 ]);
-const GOAL_OPTIONAL_KEYS: readonly string[] = Object.freeze(["gate", "oracleDecision", "completionProposal"]);
+const GOAL_OPTIONAL_KEYS: readonly string[] = Object.freeze(["gate", "oracleDecision", "completionProposal", "scope", "scopeLabel"]);
 const USAGE_REQUIRED_KEYS: readonly string[] = Object.freeze(["tokensUsed", "activeSeconds", "turnsUsed"]);
 const USAGE_OPTIONAL_KEYS: readonly string[] = Object.freeze(["costUsed"]);
 const LOOP_REQUIRED_KEYS: readonly string[] = Object.freeze(["enabled", "maxTurns"]);
@@ -206,6 +211,8 @@ export function normalizeRuntimeGoal(value: unknown): RuntimeGoal | undefined {
   }
   const status = asRuntimeGoalStatus(value.status);
   if (!status) return undefined;
+  if (value.scope !== undefined && !isCanonicalGoalScope(value.scope)) return undefined;
+  if (value.scopeLabel !== undefined && !isValidScopeLabel(value.scopeLabel)) return undefined;
   if (!safeIntegerAtLeast(value.revision, 1)) return undefined;
   if (!safeIntegerAtLeast(value.createdAt, 0) || !safeIntegerAtLeast(value.updatedAt, 0)) return undefined;
 
@@ -261,6 +268,8 @@ export function normalizeRuntimeGoal(value: unknown): RuntimeGoal | undefined {
     goalId: value.goalId,
     objective: value.objective,
     status,
+    ...(value.scope !== undefined ? { scope: value.scope } : {}),
+    ...(value.scopeLabel !== undefined ? { scopeLabel: value.scopeLabel } : {}),
     ...(gate ? { gate: Object.freeze(gate) } : {}),
     ...(oracleDecision ? { oracleDecision } : {}),
     ...(completionProposal ? { completionProposal } : {}),
@@ -292,6 +301,10 @@ export interface CreateRuntimeGoalOptions {
   readonly now: number;
   readonly maxTurns?: number;
   readonly gate?: RuntimeGoalGate;
+  /** Canonical scope (shared/scope.ts). Undefined/"local" = legacy solo lane. */
+  readonly scope?: string;
+  /** Display-only scope label (e.g. mesh alias). */
+  readonly scopeLabel?: string;
 }
 
 /** Build the canonical fresh goal: active, revision 1, zero usage, loop on. */
@@ -314,6 +327,8 @@ export function createRuntimeGoal(objective: string, options: CreateRuntimeGoalO
     goalId: options.goalId,
     objective: trimmed,
     status: "active",
+    ...(options.scope !== undefined ? { scope: options.scope } : {}),
+    ...(options.scopeLabel !== undefined ? { scopeLabel: options.scopeLabel } : {}),
     ...(options.gate !== undefined ? { gate: Object.freeze({ ...options.gate }) } : {}),
     usage: Object.freeze({ tokensUsed: 0, activeSeconds: 0, turnsUsed: 0 }),
     loop: Object.freeze({
@@ -328,13 +343,15 @@ export function createRuntimeGoal(objective: string, options: CreateRuntimeGoalO
   return goal;
 }
 
-/** Project the exact 6-key 3b store record (goal_set payload). */
+/** Project the exact store record (goal_set payload); scope keys ride along. */
 export function runtimeGoalToRecord(goal: RuntimeGoal): GoalRecord {
   if (!isCanonicalGoalId(goal?.goalId)) throw new TypeError("runtimeGoalToRecord: goalId must be canonical");
   return {
     goalId: goal.goalId,
     objective: goal.objective,
     status: goal.status,
+    ...(goal.scope !== undefined ? { scope: goal.scope } : {}),
+    ...(goal.scopeLabel !== undefined ? { scopeLabel: goal.scopeLabel } : {}),
     revision: goal.revision,
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt,
@@ -352,6 +369,8 @@ export function runtimeGoalFromRecord(record: GoalRecord): RuntimeGoal {
     goalId: record.goalId,
     objective: record.objective,
     status: record.status,
+    ...(record.scope !== undefined ? { scope: record.scope } : {}),
+    ...(record.scopeLabel !== undefined ? { scopeLabel: record.scopeLabel } : {}),
     usage: Object.freeze({ tokensUsed: 0, activeSeconds: 0, turnsUsed: 0 }),
     loop: Object.freeze({ enabled: true, maxTurns: DEFAULT_GOAL_MAX_TURNS }),
     revision: record.revision,

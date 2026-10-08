@@ -5,8 +5,34 @@ description: Use when planning or running long multi-step work with the pi-goals
 
 # pi-goals — goal/TODO work-graph usage
 
-Parent-owned goal work graph: one active goal, a TODO tree under it,
-delegated lanes return claims, and completion is oracle-gated.
+Parent-owned goal work graph: one active goal **per scope**, a TODO tree
+under it, delegated lanes return claims, and completion is oracle-gated.
+
+## Scopes (multi-agent swarms)
+
+Every Pi agent sharing the project cwd shares ONE `.goals` store. Scopes
+keep lanes independent:
+
+- **`local`** — solo default; bare `create_goal` targets it; pre-scope
+  stores behave exactly as before (bare mutations resolve the single
+  active goal).
+- **`agent:<sessionId>`** — private lane, shorthand `scope: "agent"`
+  (stable across /reload; mesh alias shown as scopeLabel).
+- **`room:<roomId>`** — shared lane for mesh agents of that room;
+  shorthand `scope: "room"` only when the session joined exactly one room,
+  otherwise `room:<id>` explicitly.
+
+Rules you MUST follow:
+
+- one active goal PER scope — never assume your goal is the only one in
+  the store; different agents' lanes coexist;
+- when several lanes are active, bare calls fail `scope_ambiguous` —
+  retry with `scope` or `goal_id`; `get_goals` lists every lane;
+- in a swarm (mesh session detected), ALWAYS pass an explicit `scope` on
+  `create_goal` (`agent` for your private work, `room:<id>` for shared
+  work) — the default stays `local` and only prints a hint;
+- children returning claims don't need the parent's scope:
+  `return_goal_todo_claim` resolves the owning goal by attempt id.
 
 ## When to use
 
@@ -51,14 +77,15 @@ delegated lanes return claims, and completion is oracle-gated.
 
 ## Lifecycle
 
-    /goal <objective>            create (single active goal)
-    add_goal_todos               batch a bounded plan (3-9 top-level, subtodos for breadth)
-    resolve_goal_todo            work the tree (complete/skip/block)
+    /goal <objective> [--scope s]  create (s = local | agent | room:<id>)
+    get_goals                      list every lane (disambiguate scopes)
+    add_goal_todos                 batch a bounded plan (3-9 top-level, subtodos for breadth)
+    resolve_goal_todo              work the tree (complete/skip/block)
     link lane → child returns claim → validate_goal_todo_claim → accept_goal_todo_claim
-    propose_goal_completion      when completionReady=true, no_ship=false
-    record_goal_oracle           PASS/no_ship=false binds the decision
-    update_goal status=complete  finish; /goal clear archives the view
-    /goal pause|resume <reason>  hold or continue (loop off/on)
+    propose_goal_completion        when completionReady=true, no_ship=false
+    record_goal_oracle             PASS/no_ship=false binds the decision
+    update_goal status=complete    finish; /goal clear [--scope s] archives the view
+    /goal pause|resume <reason> [--scope s]  hold or continue (loop off/on)
 
 ## Statuses
 

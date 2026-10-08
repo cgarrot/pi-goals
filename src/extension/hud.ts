@@ -23,16 +23,20 @@ export interface GoalHudState {
   readonly total: number;
   readonly open: number;
   readonly blocked: number;
+  /** Display-only scope tag (e.g. "room:default"); omitted for local lanes. */
+  readonly scope?: string;
 }
 
 /**
  * PURE renderer — no ANSI, no Pi API. Exactly one compact line with an
  * active goal, zero lines without one (the widget is then cleared).
  * Sample: "◆ goals: 7/12 done · open 5 · blocked 0"
+ * Scoped:  "◆ goals [room:default]: 7/12 done · open 5 · blocked 0"
  */
 export function renderGoalHudLines(state: GoalHudState): string[] {
   if (!state.hasGoal) return [];
-  return [`◆ goals: ${state.done}/${state.total} done · open ${state.open} · blocked ${state.blocked}`];
+  const scopeTag = state.scope !== undefined && state.scope !== "local" ? ` [${state.scope}]` : "";
+  return [`◆ goals${scopeTag}: ${state.done}/${state.total} done · open ${state.open} · blocked ${state.blocked}`];
 }
 
 /** Compact footer status text; undefined (cleared) without an active goal. */
@@ -96,6 +100,7 @@ export function goalHudStateOf(view: GoalRuntimeView | undefined, mode: GoalActi
     hasGoal: true,
     status: view.goal.status,
     mode,
+    ...(view.goal.scope !== undefined ? { scope: view.goal.scope } : {}),
     done: view.summary.done,
     total: view.summary.total,
     open: view.summary.open,

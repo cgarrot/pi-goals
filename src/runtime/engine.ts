@@ -113,6 +113,7 @@ import type { GoalClaimsSideTable, RestoredGoalStore, RestoreAllGoalsIndex, Rest
 import { CLAIMS_STREAM_SCHEMA, GOAL_STREAM_SCHEMA, RECEIPT_STREAM_SCHEMA, TODOS_STREAM_SCHEMA } from "../store/events.js";
 import type { GoalSetEvent, TodoUpdatedEvent, TodosSnapshotEvent, TodoTreePolicyRecord } from "../store/events.js";
 import { lockPath } from "../shared/paths.js";
+import { LOCAL_GOAL_SCOPE, isCanonicalGoalScope } from "../shared/scope.js";
 
 // ---------------------------------------------------------------------------
 // Options, inputs, results
@@ -140,6 +141,10 @@ export interface GoalRuntimeEngineOptions {
 export interface CreateGoalOptions {
   readonly maxTurns?: number;
   readonly gate?: RuntimeGoalGate;
+  /** Canonical scope (shared/scope.ts): local | agent:<id> | room:<id>. Default local. */
+  readonly scope?: string;
+  /** Display-only scope label (e.g. mesh alias). */
+  readonly scopeLabel?: string;
 }
 
 export interface ProposeCompletionInput {
@@ -272,30 +277,57 @@ export interface ClearGoalResult {
   readonly clearedGoalId: string;
 }
 
+/** Which goal a mutation targets: an explicit goal id (cross-scope) OR a
+ * canonical scope. Neither → legacy fallback: the single active goal
+ * store-wide (scope_ambiguous when several lanes are active). */
+export interface GoalSelector {
+  readonly goalId?: string;
+  readonly scope?: string;
+}
+/** One line of the store overview (getGoalsOverview / get_goals tool). */
+export interface GoalOverviewEntry {
+  readonly goalId: string;
+  readonly scope: string;
+  readonly scopeLabel?: string;
+  readonly status: string;
+  readonly objective: string;
+  readonly revision: number;
+  readonly todos: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+export interface GetGoalsOverviewResult {
+  readonly overview?: readonly GoalOverviewEntry[];
+  readonly diagnostics?: readonly RestoreDiagnostic[];
+}
+
 export interface GoalRuntimeEngine {
   createGoal(objective: string, cas?: GoalMutationGuardInput, options?: CreateGoalOptions): GoalEngineOutcome<CreateGoalResult>;
-  getGoal(goalId?: string): { goal?: GoalRuntimeView; diagnostics?: readonly RestoreDiagnostic[] };
-  addTodos(items: readonly AddGoalTodoNodeItem[], cas?: GoalMutationGuardInput): GoalEngineOutcome<AddTodosResult>;
+  getGoal(goalId?: string, scope?: string): { goal?: GoalRuntimeView; diagnostics?: readonly RestoreDiagnostic[] };
+  getGoalsOverview(): GetGoalsOverviewResult;
+  addTodos(items: readonly AddGoalTodoNodeItem[], cas?: GoalMutationGuardInput, selector?: GoalSelector): GoalEngineOutcome<AddTodosResult>;
   updateTodoMetadata(
     ref: GoalTodoCanonicalReferenceInput,
     patch: GoalTodoNodeMetadataPatch,
     cas?: GoalMutationGuardInput,
+    selector?: GoalSelector,
   ): GoalEngineOutcome<UpdateTodoMetadataResult>;
   resolveTodo(
     ref: GoalTodoCanonicalReferenceInput,
     action: GoalTodoAction,
     input: GoalTodoTransitionInput,
     cas?: GoalMutationGuardInput,
+    selector?: GoalSelector,
   ): GoalEngineOutcome<ResolveTodoResult>;
-  linkDelegation(ref: GoalTodoCanonicalReferenceInput, input: LinkDelegationInput, cas?: GoalMutationGuardInput): GoalEngineOutcome<LinkDelegationResult>;
-  returnClaim(attemptId: string, input: ReturnClaimInput, cas?: GoalMutationGuardInput): GoalEngineOutcome<ReturnClaimResult>;
-  recordClaimValidation(attemptId: string, input: ClaimValidationInput, cas?: GoalMutationGuardInput): GoalEngineOutcome<RecordClaimValidationResult>;
-  proposeCompletion(input: ProposeCompletionInput, cas?: GoalMutationGuardInput): GoalEngineOutcome<ProposeCompletionResult>;
-  recordOracleDecision(review: OracleReviewSubmission, cas?: GoalMutationGuardInput): GoalEngineOutcome<RecordOracleDecisionResult>;
-  completeGoal(cas?: GoalMutationGuardInput, echoes?: CompleteGoalEchoes): GoalEngineOutcome<CompleteGoalResult>;
-  pauseGoal(reason: string, cas?: GoalMutationGuardInput): GoalEngineOutcome<PauseGoalResult>;
-  resumeGoal(reason: string, cas?: GoalMutationGuardInput, extraTurns?: number): GoalEngineOutcome<ResumeGoalResult>;
-  clearGoal(cas?: GoalMutationGuardInput): GoalEngineOutcome<ClearGoalResult>;
+  linkDelegation(ref: GoalTodoCanonicalReferenceInput, input: LinkDelegationInput, cas?: GoalMutationGuardInput, selector?: GoalSelector): GoalEngineOutcome<LinkDelegationResult>;
+  returnClaim(attemptId: string, input: ReturnClaimInput, cas?: GoalMutationGuardInput, selector?: GoalSelector): GoalEngineOutcome<ReturnClaimResult>;
+  recordClaimValidation(attemptId: string, input: ClaimValidationInput, cas?: GoalMutationGuardInput, selector?: GoalSelector): GoalEngineOutcome<RecordClaimValidationResult>;
+  proposeCompletion(input: ProposeCompletionInput, cas?: GoalMutationGuardInput, selector?: GoalSelector): GoalEngineOutcome<ProposeCompletionResult>;
+  recordOracleDecision(review: OracleReviewSubmission, cas?: GoalMutationGuardInput, selector?: GoalSelector): GoalEngineOutcome<RecordOracleDecisionResult>;
+  completeGoal(cas?: GoalMutationGuardInput, echoes?: CompleteGoalEchoes, selector?: GoalSelector): GoalEngineOutcome<CompleteGoalResult>;
+  pauseGoal(reason: string, cas?: GoalMutationGuardInput, selector?: GoalSelector): GoalEngineOutcome<PauseGoalResult>;
+  resumeGoal(reason: string, cas?: GoalMutationGuardInput, extraTurns?: number, selector?: GoalSelector): GoalEngineOutcome<ResumeGoalResult>;
+  clearGoal(cas?: GoalMutationGuardInput, selector?: GoalSelector): GoalEngineOutcome<ClearGoalResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +346,7 @@ export type GoalEngineErrorCode =
   | "store_write_failed"
   | "goal_missing"
   | "goal_already_active"
+  | "scope_ambiguous"
   | "multiple_active_goals"
   | "goal_status_invalid"
   | "reason_required"
@@ -394,6 +427,12 @@ function compactRecord(value: Record<string, unknown>): Record<string, unknown> 
     if (entry !== undefined) out[key] = entry;
   }
   return out;
+}
+
+/** Selector keys folded into every mutation payload so the CAS request
+ * hash binds the intended target goal (replay stays deterministic). */
+function selectorKeys(selector: GoalSelector | undefined): Record<string, unknown> {
+  return compactRecord({ goal_id: selector?.goalId, scope: selector?.scope });
 }
 
 function deepClone<T>(value: T): T {
@@ -562,18 +601,11 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     return blocked;
   }
 
-  function findActiveGoal(index: RestoreAllGoalsIndex): { snapshot?: GoalSnapshot; error?: GoalEngineError } {
-    const activeIds: string[] = [];
-    for (const [goalId, result] of Object.entries(index.goals)) {
-      if (result.status === "ok" && result.goal && result.goal.status !== "complete") activeIds.push(goalId);
-    }
-    if (activeIds.length > 1) {
-      return { error: engineErr("multiple_active_goals", `multiple non-complete goals exist: ${[...activeIds].sort().join(", ")}`, "fix_input") };
-    }
-    const goalId = activeIds[0];
-    if (goalId === undefined) {
-      return { error: engineErr("goal_missing", "no active (non-complete) goal exists", "fix_input") };
-    }
+  function scopeOfRecord(record: { readonly scope?: string }): string {
+    return record.scope ?? LOCAL_GOAL_SCOPE;
+  }
+
+  function snapshotForGoalId(index: RestoreAllGoalsIndex, goalId: string): { snapshot?: GoalSnapshot; error?: GoalEngineError } {
     const result = index.goals[goalId];
     if (!result || result.status !== "ok" || !result.goal) {
       return { error: engineErr("restore_blocked", `goal ${goalId} could not be restored`, "after_context_change") };
@@ -581,13 +613,97 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     return { snapshot: buildSnapshot(result) };
   }
 
-  function findCurrentGoal(index: RestoreAllGoalsIndex): { snapshot?: GoalSnapshot; error?: GoalEngineError } {
-    const active = findActiveGoal(index);
-    if (active.snapshot || (active.error && active.error.code !== "goal_missing")) return active;
-    // no non-complete goal: fall back to the most recent complete goal (clear semantics)
+  function activeGoalEntries(index: RestoreAllGoalsIndex): readonly { readonly goalId: string; readonly scope: string }[] {
+    const entries: { goalId: string; scope: string }[] = [];
+    for (const [goalId, result] of Object.entries(index.goals)) {
+      if (result.status === "ok" && result.goal && result.goal.status !== "complete") {
+        entries.push({ goalId, scope: scopeOfRecord(result.goal) });
+      }
+    }
+    return entries.sort((a, b) => (a.goalId < b.goalId ? -1 : 1));
+  }
+
+  /** zob-parity invariant, scoped (D-E8): at most ONE non-complete goal
+   * per scope. multiple_active_goals fires only within one scope (corrupt
+   * or hand-written store); different scopes never block each other. */
+  function findActiveGoalInScope(index: RestoreAllGoalsIndex, scope: string): { snapshot?: GoalSnapshot; error?: GoalEngineError } {
+    const active = activeGoalEntries(index).filter((entry) => entry.scope === scope);
+    if (active.length > 1) {
+      return { error: engineErr("multiple_active_goals", `multiple non-complete goals exist in scope ${scope}: ${active.map((entry) => entry.goalId).join(", ")}`, "fix_input") };
+    }
+    const goalId = active[0]?.goalId;
+    if (goalId === undefined) {
+      return { error: engineErr("goal_missing", `no active (non-complete) goal exists in scope ${scope}`, "fix_input") };
+    }
+    return snapshotForGoalId(index, goalId);
+  }
+
+  /**
+   * Target-goal resolution (D-E8):
+   *   1. selector.goalId → that exact goal (cross-scope addressing);
+   *   2. selector.scope  → the single active goal of that scope;
+   *   3. no selector    → legacy solo fallback: exactly one active goal
+   *      store-wide; zero → goal_missing; several → scope_ambiguous naming
+   *      every active scope so the caller can retry with scope/goal_id.
+   */
+  function resolveTargetGoal(index: RestoreAllGoalsIndex, selector?: GoalSelector): { snapshot?: GoalSnapshot; error?: GoalEngineError } {
+    if (selector?.goalId !== undefined) {
+      if (!Object.prototype.hasOwnProperty.call(index.goals, selector.goalId)) {
+        return { error: engineErr("goal_missing", `no goal ${selector.goalId} exists in the store`, "fix_input") };
+      }
+      return snapshotForGoalId(index, selector.goalId);
+    }
+    if (selector?.scope !== undefined) return findActiveGoalInScope(index, selector.scope);
+    const active = activeGoalEntries(index);
+    if (active.length === 0) return { error: engineErr("goal_missing", "no active (non-complete) goal exists", "fix_input") };
+    if (active.length > 1) {
+      const scopes = [...new Set(active.map((entry) => entry.scope))].sort();
+      return {
+        error: engineErr(
+          "scope_ambiguous",
+          `${active.length} active goals across scopes (${scopes.join(", ")}) — pass a scope (local | agent:<id> | room:<id>) or goal_id`,
+          "fix_input",
+        ),
+      };
+    }
+    return snapshotForGoalId(index, active[0]!.goalId);
+  }
+
+  /** Attempt-keyed resolution for cross-scope claim flows: the child
+   * returning/validating a claim may not share the parent's default scope,
+   * so the attempt binding pinpoints the owning goal directly. */
+  function resolveGoalByAttempt(index: RestoreAllGoalsIndex, attemptId: string, selector?: GoalSelector): { snapshot?: GoalSnapshot; error?: GoalEngineError } {
+    const candidates: string[] = [];
+    for (const [goalId, result] of Object.entries(index.goals)) {
+      if (result.status === "ok" && Object.prototype.hasOwnProperty.call(result.claims.attempts, attemptId)) candidates.push(goalId);
+    }
+    if (candidates.length === 1) return snapshotForGoalId(index, candidates[0]!);
+    if (candidates.length > 1) {
+      return { error: engineErr("claim_error", `attempt ${attemptId} is bound in multiple goals (${candidates.sort().join(", ")})`, "after_context_change", { claimCode: "attempt_ambiguous" }) };
+    }
+    return resolveTargetGoal(index, selector);
+  }
+
+  /** clear-semantics current goal within the resolved lane: the active
+   * goal, else the most recently updated goal of the same lane. */
+  function findCurrentGoal(index: RestoreAllGoalsIndex, selector?: GoalSelector): { snapshot?: GoalSnapshot; error?: GoalEngineError } {
+    if (selector?.goalId !== undefined) {
+      if (!Object.prototype.hasOwnProperty.call(index.goals, selector.goalId)) {
+        return { error: engineErr("goal_missing", `no goal ${selector.goalId} exists in the store`, "fix_input") };
+      }
+      return snapshotForGoalId(index, selector.goalId);
+    }
+    const scope = selector?.scope;
+    const active = scope !== undefined ? activeGoalEntries(index).filter((entry) => entry.scope === scope) : activeGoalEntries(index);
+    if (active.length === 1) return snapshotForGoalId(index, active[0]!.goalId);
+    if (active.length > 1) {
+      return { error: engineErr("multiple_active_goals", `multiple non-complete goals exist${scope !== undefined ? ` in scope ${scope}` : ""}: ${active.map((entry) => entry.goalId).join(", ")}`, "fix_input") };
+    }
+    // no active goal in the lane: fall back to the most recent goal of the same lane (clear semantics)
     let best: GoalSnapshot | undefined;
     for (const result of Object.values(index.goals)) {
       if (result.status !== "ok" || !result.goal) continue;
+      if (scope !== undefined && scopeOfRecord(result.goal) !== scope) continue;
       const snap = buildSnapshot(result);
       if (
         !best
@@ -846,9 +962,18 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     if (createOptions?.maxTurns !== undefined && !(Number.isSafeInteger(createOptions.maxTurns) && createOptions.maxTurns >= 1)) {
       return engineErr("invalid_input", "maxTurns must be a safe integer >= 1", "fix_input");
     }
-    const payload = compactRecord({ objective: trimmed, max_turns: createOptions?.maxTurns });
+    if (createOptions?.scope !== undefined && !isCanonicalGoalScope(createOptions.scope)) {
+      return engineErr("invalid_input", `scope must be canonical (local | agent:<id> | room:<id>), got: ${createOptions.scope}`, "fix_input");
+    }
+    const payload = compactRecord({
+      objective: trimmed,
+      max_turns: createOptions?.maxTurns,
+      scope: createOptions?.scope,
+      scope_label: createOptions?.scopeLabel,
+    });
     return run("create_goal", payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
+      const scope = createOptions?.scope ?? LOCAL_GOAL_SCOPE;
+      const active = findActiveGoalInScope(ctx.index, scope);
       if (ctx.replayed) {
         return replayedOk(
           {
@@ -860,7 +985,7 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       }
       if (active.error && active.error.code !== "goal_missing") return active.error;
       if (active.snapshot) {
-        return engineErr("goal_already_active", `a non-complete goal ${active.snapshot.goalId} already exists; complete or clear it first`, "fix_input");
+        return engineErr("goal_already_active", `a non-complete goal ${active.snapshot.goalId} already exists in scope ${scope}; complete or clear it first (or create in another scope)`, "fix_input");
       }
       const casError = checkCas(ctx, { goalRevision: 0 });
       if (casError) return casError;
@@ -870,6 +995,8 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
         now: ctx.now,
         ...(createOptions?.maxTurns !== undefined ? { maxTurns: createOptions.maxTurns } : {}),
         ...(createOptions?.gate !== undefined ? { gate: createOptions.gate } : {}),
+        ...(createOptions?.scope !== undefined ? { scope: createOptions.scope } : {}),
+        ...(createOptions?.scopeLabel !== undefined ? { scopeLabel: createOptions.scopeLabel } : {}),
       });
       appendGoalSetEvent(ctx, goalId, goal, 0);
       writeRuntimeOverlay(goalId, goal, {});
@@ -878,7 +1005,7 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function getGoal(goalId?: string): { goal?: GoalRuntimeView; diagnostics?: readonly RestoreDiagnostic[] } {
+  function getGoal(goalId?: string, scope?: string): { goal?: GoalRuntimeView; diagnostics?: readonly RestoreDiagnostic[] } {
     const index = restoreAllGoals(stateDir, readOptions);
     const blocked = collectBlocked(index);
     if (blocked.length > 0) return { diagnostics: blocked };
@@ -887,13 +1014,40 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       if (!result || result.status !== "ok" || !result.goal) return {};
       return { goal: viewOf(buildSnapshot(result)) };
     }
-    const active = findActiveGoal(index);
-    if (!active.snapshot) return {};
-    return { goal: viewOf(active.snapshot) };
+    // scope-aware read: an explicit scope narrows the lane; the legacy bare
+    // read resolves the single active goal store-wide and stays undefined
+    // when several lanes are active (the get_goals overview disambiguates).
+    const resolved = scope !== undefined ? findActiveGoalInScope(index, scope) : resolveTargetGoal(index);
+    if (!resolved.snapshot) return {};
+    return { goal: viewOf(resolved.snapshot) };
   }
 
-  function addTodos(items: readonly AddGoalTodoNodeItem[], cas: GoalMutationGuardInput | undefined): GoalEngineOutcome<AddTodosResult> {
+  function getGoalsOverview(): GetGoalsOverviewResult {
+    const index = restoreAllGoals(stateDir, readOptions);
+    const blocked = collectBlocked(index);
+    if (blocked.length > 0) return { diagnostics: blocked };
+    const entries: GoalOverviewEntry[] = [];
+    for (const result of Object.values(index.goals)) {
+      if (result.status !== "ok" || !result.goal) continue;
+      entries.push({
+        goalId: result.goalId,
+        scope: scopeOfRecord(result.goal),
+        ...(result.goal.scopeLabel !== undefined ? { scopeLabel: result.goal.scopeLabel } : {}),
+        status: result.goal.status,
+        objective: result.goal.objective,
+        revision: result.revisions.goal,
+        todos: result.todoGraph.nodes.length,
+        createdAt: result.goal.createdAt,
+        updatedAt: result.goal.updatedAt,
+      });
+    }
+    entries.sort((a, b) => a.updatedAt - b.updatedAt || (a.goalId < b.goalId ? -1 : 1));
+    return { overview: entries };
+  }
+
+  function addTodos(items: readonly AddGoalTodoNodeItem[], cas: GoalMutationGuardInput | undefined, selector?: GoalSelector): GoalEngineOutcome<AddTodosResult> {
     const payload = {
+      ...selectorKeys(selector),
       items: (items ?? []).map((item) =>
         compactRecord({
           parent_id: item?.parentId,
@@ -909,9 +1063,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       ),
     };
     return run("add_goal_todos", payload, cas, (ctx): GoalEngineOutcome<AddTodosResult> => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveTargetGoal(ctx.index, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       if (ctx.replayed) {
         return replayedOk({ created: [], todosRevision: snap.revisions.todos, summary: snap.summary }, ctx.replayReceipt!);
       }
@@ -934,9 +1088,11 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     ref: GoalTodoCanonicalReferenceInput,
     patch: GoalTodoNodeMetadataPatch,
     cas: GoalMutationGuardInput | undefined,
+    selector?: GoalSelector,
   ): GoalEngineOutcome<UpdateTodoMetadataResult> {
     const rawPatch = (patch ?? {}) as Record<string, unknown>;
     const payload = compactRecord({
+      ...selectorKeys(selector),
       todo_id: ref?.todoId,
       todo_path: ref?.todoPath,
       patch: compactRecord({
@@ -951,9 +1107,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       }),
     });
     return run("update_goal_todo", payload, cas, (ctx): GoalEngineOutcome<UpdateTodoMetadataResult> => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveTargetGoal(ctx.index, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       const resolution = resolveTodoRef(snap, ref);
       if (resolution.error) return resolution.error;
       const node = resolution.node!;
@@ -983,6 +1139,7 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     action: GoalTodoAction,
     input: GoalTodoTransitionInput,
     cas: GoalMutationGuardInput | undefined,
+    selector?: GoalSelector,
   ): GoalEngineOutcome<ResolveTodoResult> {
     const toolName: GoalMutationToolName =
       action === "complete"
@@ -995,6 +1152,7 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
               ? "reject_goal_todo_claim"
               : "resolve_goal_todo";
     const payload = compactRecord({
+      ...selectorKeys(selector),
       todo_id: ref?.todoId,
       todo_path: ref?.todoPath,
       action,
@@ -1005,9 +1163,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       validation_policy: input?.validationPolicy,
     });
     return run(toolName, payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveTargetGoal(ctx.index, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       const resolution = resolveTodoRef(snap, ref);
       if (resolution.error) return resolution.error;
       const node = resolution.node!;
@@ -1082,11 +1240,12 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function linkDelegation(ref: GoalTodoCanonicalReferenceInput, input: LinkDelegationInput, cas: GoalMutationGuardInput | undefined): GoalEngineOutcome<LinkDelegationResult> {
+  function linkDelegation(ref: GoalTodoCanonicalReferenceInput, input: LinkDelegationInput, cas: GoalMutationGuardInput | undefined, selector?: GoalSelector): GoalEngineOutcome<LinkDelegationResult> {
     if (input?.delegationDepth !== undefined && !(Number.isSafeInteger(input.delegationDepth) && input.delegationDepth >= 1)) {
       return engineErr("invalid_input", "delegationDepth must be a safe integer >= 1", "fix_input");
     }
     const payload = compactRecord({
+      ...selectorKeys(selector),
       todo_id: ref?.todoId,
       todo_path: ref?.todoPath,
       attempt_id: input?.attemptId,
@@ -1096,9 +1255,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       delegation_depth: input?.delegationDepth,
     });
     return run("recover_goal_todo_delegation", payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveTargetGoal(ctx.index, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       const resolution = resolveTodoRef(snap, ref);
       if (resolution.error) return resolution.error;
       const node = resolution.node!;
@@ -1140,8 +1299,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function returnClaim(attemptId: string, input: ReturnClaimInput, cas: GoalMutationGuardInput | undefined): GoalEngineOutcome<ReturnClaimResult> {
+  function returnClaim(attemptId: string, input: ReturnClaimInput, cas: GoalMutationGuardInput | undefined, selector?: GoalSelector): GoalEngineOutcome<ReturnClaimResult> {
     const payload = compactRecord({
+      ...selectorKeys(selector),
       attempt_id: attemptId,
       claim_text: input?.claimText,
       claim_hash: input?.claimHash,
@@ -1150,9 +1310,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       no_ship: input?.noShip,
     });
     return run("recover_goal_todo_delegation", payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveGoalByAttempt(ctx.index, attemptId, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       if (ctx.replayed) {
         const claim = lookupRecord(snap.claims.claims, attemptId);
         if (!claim) return engineErr("claim_error", `no claim returned for attempt ${attemptId}`, "after_context_change");
@@ -1199,8 +1359,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function recordClaimValidation(attemptId: string, input: ClaimValidationInput, cas: GoalMutationGuardInput | undefined): GoalEngineOutcome<RecordClaimValidationResult> {
+  function recordClaimValidation(attemptId: string, input: ClaimValidationInput, cas: GoalMutationGuardInput | undefined, selector?: GoalSelector): GoalEngineOutcome<RecordClaimValidationResult> {
     const payload = compactRecord({
+      ...selectorKeys(selector),
       attempt_id: attemptId,
       run_id: input?.runId,
       verdict: input?.verdict,
@@ -1214,9 +1375,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       agent: input?.agent,
     });
     return run("validate_goal_todo_claim", payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveGoalByAttempt(ctx.index, attemptId, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       if (ctx.replayed) {
         const validation = lookupRecord(snap.claims.validations, attemptId);
         if (!validation) return engineErr("claim_error", `no validation recorded for attempt ${attemptId}`, "after_context_change");
@@ -1269,7 +1430,7 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function proposeCompletion(input: ProposeCompletionInput, cas: GoalMutationGuardInput | undefined): GoalEngineOutcome<ProposeCompletionResult> {
+  function proposeCompletion(input: ProposeCompletionInput, cas: GoalMutationGuardInput | undefined, selector?: GoalSelector): GoalEngineOutcome<ProposeCompletionResult> {
     if (typeof input?.completionSummary !== "string") {
       return engineErr("invalid_input", "completionSummary must be a string", "fix_input");
     }
@@ -1279,6 +1440,7 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       }
     }
     const payload = compactRecord({
+      ...selectorKeys(selector),
       completion_summary: input.completionSummary,
       requirements_checked: input.requirementsChecked?.slice(),
       evidence_refs: input.evidenceRefs?.slice(),
@@ -1287,9 +1449,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
       no_ship: input?.noShip,
     });
     return run("propose_goal_completion", payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveTargetGoal(ctx.index, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       if (ctx.replayed) {
         return replayedOk({ goal: snap.runtime, ...(snap.runtime.completionProposal ? { proposal: snap.runtime.completionProposal } : {}) }, ctx.replayReceipt!);
       }
@@ -1343,17 +1505,18 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function recordOracleDecision(review: OracleReviewSubmission, cas: GoalMutationGuardInput | undefined): GoalEngineOutcome<RecordOracleDecisionResult> {
+  function recordOracleDecision(review: OracleReviewSubmission, cas: GoalMutationGuardInput | undefined, selector?: GoalSelector): GoalEngineOutcome<RecordOracleDecisionResult> {
     const payload = compactRecord({
+      ...selectorKeys(selector),
       verdict: review?.verdict,
       no_ship: review?.noShip,
       evidence_summary: review?.evidenceSummary,
       evidence_refs: review?.evidenceRefs?.slice(),
     });
     return run("record_goal_oracle", payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveTargetGoal(ctx.index, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       if (ctx.replayed) {
         if (!snap.runtime.oracleDecision) {
           return engineErr("oracle_not_fresh", "no oracle decision bound to the current goal state", "after_context_change", {
@@ -1412,15 +1575,16 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function completeGoal(cas: GoalMutationGuardInput | undefined, echoes?: CompleteGoalEchoes): GoalEngineOutcome<CompleteGoalResult> {
+  function completeGoal(cas: GoalMutationGuardInput | undefined, echoes?: CompleteGoalEchoes, selector?: GoalSelector): GoalEngineOutcome<CompleteGoalResult> {
     const payload = compactRecord({
+      ...selectorKeys(selector),
       expected_proposal_hash: echoes?.expectedProposalHash,
       expected_oracle_decision_hash: echoes?.expectedOracleDecisionHash,
     });
     return run("update_goal", payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveTargetGoal(ctx.index, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       if (ctx.replayed) {
         return replayedOk({ goal: snap.runtime }, ctx.replayReceipt!);
       }
@@ -1460,12 +1624,12 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function pauseGoal(reason: string, cas: GoalMutationGuardInput | undefined): GoalEngineOutcome<PauseGoalResult> {
-    const payload = compactRecord({ pause_reason: reason });
+  function pauseGoal(reason: string, cas: GoalMutationGuardInput | undefined, selector?: GoalSelector): GoalEngineOutcome<PauseGoalResult> {
+    const payload = compactRecord({ ...selectorKeys(selector), pause_reason: reason });
     return run("update_goal", payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveTargetGoal(ctx.index, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       if (ctx.replayed) {
         return replayedOk({ goal: snap.runtime, previousStatus: snap.runtime.status }, ctx.replayReceipt!);
       }
@@ -1506,12 +1670,12 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function resumeGoal(reason: string, cas: GoalMutationGuardInput | undefined, extraTurns?: number): GoalEngineOutcome<ResumeGoalResult> {
-    const payload = compactRecord({ resume_reason: reason, additional_turns: extraTurns });
+  function resumeGoal(reason: string, cas: GoalMutationGuardInput | undefined, extraTurns?: number, selector?: GoalSelector): GoalEngineOutcome<ResumeGoalResult> {
+    const payload = compactRecord({ ...selectorKeys(selector), resume_reason: reason, additional_turns: extraTurns });
     return run("resume_goal", payload, cas, (ctx) => {
-      const active = findActiveGoal(ctx.index);
-      if (active.error) return active.error;
-      const snap = active.snapshot!;
+      const target = resolveTargetGoal(ctx.index, selector);
+      if (target.error) return target.error;
+      const snap = target.snapshot!;
       if (ctx.replayed) {
         return replayedOk({ goal: snap.runtime, previousStatus: snap.runtime.status }, ctx.replayReceipt!);
       }
@@ -1547,9 +1711,9 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
     });
   }
 
-  function clearGoal(cas: GoalMutationGuardInput | undefined): GoalEngineOutcome<ClearGoalResult> {
-    return run("update_goal", { clear: true }, cas, (ctx) => {
-      const current = findCurrentGoal(ctx.index);
+  function clearGoal(cas: GoalMutationGuardInput | undefined, selector?: GoalSelector): GoalEngineOutcome<ClearGoalResult> {
+    return run("update_goal", { clear: true, ...selectorKeys(selector) }, cas, (ctx) => {
+      const current = findCurrentGoal(ctx.index, selector);
       if (ctx.replayed) {
         return replayedOk({ clearedGoalId: current.snapshot?.goalId ?? "" }, ctx.replayReceipt!);
       }
@@ -1568,6 +1732,7 @@ export function createRuntimeGoalEngine(options: GoalRuntimeEngineOptions): Goal
   return {
     createGoal,
     getGoal,
+    getGoalsOverview,
     addTodos,
     updateTodoMetadata,
     resolveTodo,
